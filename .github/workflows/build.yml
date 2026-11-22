@@ -420,4 +420,179 @@ jobs:
             import android.widget.EditText
             import android.widget.LinearLayout
             import android.widget.ScrollView
-            import android.widget.
+            import android.widget.TextView
+            import android.widget.Toast
+            import java.io.File
+
+            class MainActivity : Activity() {
+                private val fields = LinkedHashMap<String, EditText>()
+                private val defaults = linkedMapOf(
+                    "petX" to 88, "petY" to 75,
+                    "atkX" to 92, "atkY" to 60,
+                    "joyX" to 15, "joyY" to 70,
+                    "radius" to 90, "fixed" to 1, "dir" to 0, "bossMiss" to 4,
+                    "thrNpc" to 75, "thrBoss" to 75
+                )
+                private val labels = mapOf(
+                    "petX" to "Bouton attaque ANIMAL - X (% écran)",
+                    "petY" to "Bouton attaque ANIMAL - Y (% écran)",
+                    "atkX" to "Bouton attaque PERSO - X (% écran)",
+                    "atkY" to "Bouton attaque PERSO - Y (% écran)",
+                    "joyX" to "Centre du joystick - X (% écran)",
+                    "joyY" to "Centre du joystick - Y (% écran)",
+                    "radius" to "Amplitude du joystick (pixels)",
+                    "fixed" to "Joystick en mode FIXE (1 = fixe, 0 = libre)",
+                    "dir" to "Direction tenue autour du boss en degrés (0=droite, 90=bas, 180=gauche, 270=haut)",
+                    "bossMiss" to "Vérifications sans barre avant la fin du boss (1 = environ 0,3 s)",
+                    "thrNpc" to "Sensibilité détection PNJ (%)",
+                    "thrBoss" to "Sensibilité détection boss (%)"
+                )
+                private val PICK_NPC = 1
+                private val PICK_BOSS = 2
+                private val REQ_CAPTURE = 3
+
+                override fun onCreate(savedInstanceState: Bundle?) {
+                    super.onCreate(savedInstanceState)
+                    val prefs = getSharedPreferences("cfg", MODE_PRIVATE)
+                    val sv = ScrollView(this)
+                    val box = LinearLayout(this)
+                    box.orientation = LinearLayout.VERTICAL
+                    box.setPadding(40, 40, 40, 40)
+                    sv.addView(box)
+
+                    fun button(t: String, action: () -> Unit) {
+                        val b = Button(this)
+                        b.text = t
+                        b.setOnClickListener { action() }
+                        box.addView(b)
+                    }
+
+                    val title = TextView(this)
+                    title.text = "WildCraft Bot\n1) Autorisations  2) Images  3) Réglages  4) Démarrer"
+                    box.addView(title)
+
+                    button("1a. Autoriser l'affichage par-dessus les applis") {
+                        startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + packageName)))
+                    }
+                    button("1b. Activer le service d'accessibilité (WildCraft Bot)") {
+                        startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                    }
+                    button("2a. Choisir l'image du PNJ (capture rognée)") { pick(PICK_NPC) }
+                    button("2b. Choisir l'image de la barre de vie du boss") { pick(PICK_BOSS) }
+
+                    for ((k, d) in defaults) {
+                        val tv = TextView(this)
+                        tv.text = labels[k]
+                        box.addView(tv)
+                        val et = EditText(this)
+                        et.setText(prefs.getInt(k, d).toString())
+                        et.inputType = android.text.InputType.TYPE_CLASS_NUMBER
+                        box.addView(et)
+                        fields[k] = et
+                    }
+
+                    button("4. DÉMARRER (puis ouvrez WildCraft)") { start() }
+                    button("Arrêter le bot") { stopService(Intent(this, BotService::class.java)) }
+                    setContentView(sv)
+                }
+
+                private fun pick(code: Int) {
+                    val i = Intent(Intent.ACTION_GET_CONTENT)
+                    i.type = "image/*"
+                    startActivityForResult(i, code)
+                }
+
+                private fun save() {
+                    val e = getSharedPreferences("cfg", MODE_PRIVATE).edit()
+                    for ((k, et) in fields) e.putInt(k, et.text.toString().toIntOrNull() ?: defaults[k]!!)
+                    e.apply()
+                }
+
+                private fun start() {
+                    if (!Settings.canDrawOverlays(this)) {
+                        Toast.makeText(this, "Autorisez d'abord l'affichage par-dessus les applis (1a)", Toast.LENGTH_LONG).show()
+                        return
+                    }
+                    if (BotAccessibility.instance == null) {
+                        Toast.makeText(this, "Activez d'abord le service d'accessibilité (1b)", Toast.LENGTH_LONG).show()
+                        return
+                    }
+                    if (!File(filesDir, "npc.png").exists() || !File(filesDir, "boss.png").exists()) {
+                        Toast.makeText(this, "Choisissez les deux images (2a et 2b)", Toast.LENGTH_LONG).show()
+                        return
+                    }
+                    save()
+                    val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                    startActivityForResult(mpm.createScreenCaptureIntent(), REQ_CAPTURE)
+                }
+
+                override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                    super.onActivityResult(requestCode, resultCode, data)
+                    if (resultCode != RESULT_OK || data == null) return
+                    if (requestCode == PICK_NPC || requestCode == PICK_BOSS) {
+                        val uri = data.data ?: return
+                        val name = if (requestCode == PICK_NPC) "npc.png" else "boss.png"
+                        contentResolver.openInputStream(uri)?.use { input ->
+                            File(filesDir, name).outputStream().use { input.copyTo(it) }
+                        }
+                        Toast.makeText(this, "Image enregistrée", Toast.LENGTH_SHORT).show()
+                    } else if (requestCode == REQ_CAPTURE) {
+                        val s = Intent(this, BotService::class.java)
+                        s.putExtra("code", resultCode)
+                        s.putExtra("data", data)
+                        startForegroundService(s)
+                        Toast.makeText(this, "Ouvrez WildCraft et utilisez le bouton flottant ▶", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+            WCEOF
+            mkdir -p app/src/main/res/values
+            cat > app/src/main/res/values/strings.xml <<'WCEOF'
+            <?xml version="1.0" encoding="utf-8"?>
+            <resources>
+                <string name="app_name">WildCraft Bot</string>
+                <string name="acc_desc">Permet au bot d\'appuyer sur l\'écran et de bouger le joystick.</string>
+            </resources>
+            WCEOF
+            mkdir -p app/src/main/res/xml
+            cat > app/src/main/res/xml/accessibility_config.xml <<'WCEOF'
+            <?xml version="1.0" encoding="utf-8"?>
+            <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+                android:accessibilityEventTypes="typeAllMask"
+                android:accessibilityFeedbackType="feedbackGeneric"
+                android:canPerformGestures="true"
+                android:description="@string/acc_desc"
+                android:notificationTimeout="100" />
+            WCEOF
+            cat > build.gradle.kts <<'WCEOF'
+            plugins {
+                id("com.android.application") version "8.5.2" apply false
+                id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+            }
+            WCEOF
+            cat > gradle.properties <<'WCEOF'
+            org.gradle.jvmargs=-Xmx2g
+            android.useAndroidX=true
+            WCEOF
+            cat > settings.gradle.kts <<'WCEOF'
+            pluginManagement {
+                repositories { google(); mavenCentral(); gradlePluginPortal() }
+            }
+            dependencyResolutionManagement {
+                repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+                repositories { google(); mavenCentral() }
+            }
+            rootProject.name = "WildcraftBot"
+            include(":app")
+            WCEOF
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.7'
+      - name: Compiler
+        run: gradle assembleDebug --no-daemon
+      - name: Publier l'APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-${{ github.run_number }}
+          name: WildCraft Bot ${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk
