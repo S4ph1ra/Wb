@@ -4,6 +4,9 @@ on:
   push:
 permissions:
   contents: write
+env:
+  # >>> Changez le nom de l'appli ici (evitez les symboles | et &) :
+  APP_NAME: "WildCraft Bot"
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -70,6 +73,10 @@ jobs:
                         android:foregroundServiceType="mediaProjection" />
 
                     <service
+                        android:name=".CalibService"
+                        android:exported="false" />
+
+                    <service
                         android:name=".BotAccessibility"
                         android:exported="true"
                         android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
@@ -112,27 +119,28 @@ jobs:
                     dispatchGesture(g, null, null)
                 }
 
-                /** Joystick: glisse de (jx,jy) vers (tx,ty) ET maintient le bouton d'attaque, en même temps. */
-                fun moveAndAttack(jx: Int, jy: Int, tx: Int, ty: Int, ax: Int, ay: Int, durMs: Long) {
+                /** Mode joystick LIBRE : glisse de (jx,jy) vers (tx,ty), avec ou sans appui sur le bouton d'attaque. */
+                fun moveAndAttack(jx: Int, jy: Int, tx: Int, ty: Int, ax: Int, ay: Int, durMs: Long, attack: Boolean) {
                     val joy = Path().apply { moveTo(jx.toFloat(), jy.toFloat()); lineTo(tx.toFloat(), ty.toFloat()) }
-                    val atk = Path().apply { moveTo(ax.toFloat(), ay.toFloat()) }
-                    val g = GestureDescription.Builder()
+                    val b = GestureDescription.Builder()
                         .addStroke(GestureDescription.StrokeDescription(joy, 0, durMs))
-                        .addStroke(GestureDescription.StrokeDescription(atk, 0, durMs))
-                        .build()
-                    dispatchGesture(g, null, null)
+                    if (attack) {
+                        val atk = Path().apply { moveTo(ax.toFloat(), ay.toFloat()) }
+                        b.addStroke(GestureDescription.StrokeDescription(atk, 0, 60))
+                    }
+                    dispatchGesture(b.build(), null, null)
                 }
 
                 /**
-                 * Mode joystick FIXE : pousse le joystick dans une direction et la maintient, avec le bouton
-                 * d'attaque, tant que keep() renvoie true. Bloquant (à appeler hors du thread principal).
+                 * Mode joystick FIXE : pousse le joystick dans une direction et la maintient tant que keep()
+                 * renvoie true. Si attack est vrai, un simple appui sur le bouton d'attaque est ajouté à chaque
+                 * tranche (environ une fois par seconde), pendant que le joystick reste tenu. Bloquant.
                  */
-                fun holdDirection(jx: Int, jy: Int, tx: Int, ty: Int, ax: Int, ay: Int, keep: () -> Boolean) {
+                fun holdDirection(jx: Int, jy: Int, tx: Int, ty: Int, ax: Int, ay: Int, attack: Boolean, keep: () -> Boolean) {
                     val joyMove = Path().apply { moveTo(jx.toFloat(), jy.toFloat()); lineTo(tx.toFloat(), ty.toFloat()) }
                     val joyHold = Path().apply { moveTo(tx.toFloat(), ty.toFloat()) }
-                    val atkHold = Path().apply { moveTo(ax.toFloat(), ay.toFloat()) }
-                    var j = GestureDescription.StrokeDescription(joyMove, 0, 200, true)
-                    var a = GestureDescription.StrokeDescription(atkHold, 0, 200, true)
+                    val atkTap = Path().apply { moveTo(ax.toFloat(), ay.toFloat()) }
+                    var j = GestureDescription.StrokeDescription(joyMove, 0, 300, true)
                     var cancelled = false
                     while (true) {
                         val latch = CountDownLatch(1)
@@ -140,18 +148,18 @@ jobs:
                             override fun onCompleted(g: GestureDescription?) { latch.countDown() }
                             override fun onCancelled(g: GestureDescription?) { cancelled = true; latch.countDown() }
                         }
-                        val ok = dispatchGesture(GestureDescription.Builder().addStroke(j).addStroke(a).build(), cb, null)
+                        val b = GestureDescription.Builder().addStroke(j)
+                        if (attack) b.addStroke(GestureDescription.StrokeDescription(atkTap, 0, 60))
+                        val ok = dispatchGesture(b.build(), cb, null)
                         if (!ok) return
                         latch.await()
                         if (cancelled) return
                         if (!keep()) {
                             j = j.continueStroke(joyHold, 0, 50, false)
-                            a = a.continueStroke(atkHold, 0, 50, false)
-                            dispatchGesture(GestureDescription.Builder().addStroke(j).addStroke(a).build(), null, null)
+                            dispatchGesture(GestureDescription.Builder().addStroke(j).build(), null, null)
                             return
                         }
-                        j = j.continueStroke(joyHold, 0, 1000, true)
-                        a = a.continueStroke(atkHold, 0, 1000, true)
+                        j = j.continueStroke(joyHold, 0, 900, true)
                     }
                 }
             }
@@ -202,8 +210,8 @@ jobs:
                 @Volatile private var holding = false
                 private var w = 0
                 private var h = 0
-                private var tplNpc: Mat? = null
-                private var tplBoss: Mat? = null
+                private var tplsNpc: List<Mat> = emptyList()
+                private var tplsBoss: List<Mat> = emptyList()
 
                 override fun onBind(intent: Intent?): IBinder? = null
 
@@ -221,8 +229,8 @@ jobs:
                     }, Handler(Looper.getMainLooper()))
                     projection = p
                     setupCapture()
-                    tplNpc = loadTemplate("npc.png")
-                    tplBoss = loadTemplate("boss.png")
+                    tplsNpc = loadTemplates("npc_")
+                    tplsBoss = loadTemplates("boss_")
                     showOverlay()
                     return START_NOT_STICKY
                 }
@@ -254,9 +262,12 @@ jobs:
                     )
                 }
 
-                private fun loadTemplate(name: String): Mat? {
-                    val f = File(filesDir, name)
-                    if (!f.exists()) return null
+                private fun loadTemplates(prefix: String): List<Mat> {
+                    val files = (filesDir.listFiles() ?: emptyArray()).filter { it.name.startsWith(prefix) }
+                    return files.mapNotNull { loadTemplate(it) }
+                }
+
+                private fun loadTemplate(f: File): Mat? {
                     val bmp = BitmapFactory.decodeFile(f.path) ?: return null
                     val m = Mat()
                     Utils.bitmapToMat(bmp, m)
@@ -294,6 +305,8 @@ jobs:
                     return best >= thr
                 }
 
+                private fun foundAny(screen: Mat, tpls: List<Mat>, thr: Double): Boolean = tpls.any { found(screen, it, thr) }
+
                 private fun showOverlay() {
                     val b = Button(this)
                     b.text = "▶"
@@ -324,21 +337,21 @@ jobs:
 
                 private fun loop() {
                     val cfg = getSharedPreferences("cfg", MODE_PRIVATE)
-                    val petX = cfg.getInt("petX", 88) * w / 100
-                    val petY = cfg.getInt("petY", 75) * h / 100
+                    val btnX = (cfg.getFloat("btnFX", 90f) * w / 100f).toInt()
+                    val btnY = (cfg.getFloat("btnFY", 70f) * h / 100f).toInt()
                     val thrNpc = cfg.getInt("thrNpc", 75) / 100.0
                     val thrBoss = cfg.getInt("thrBoss", 75) / 100.0
                     var lastPet = 0L
                     while (running) {
                         val s = grab()
                         if (s == null) { Thread.sleep(200); continue }
-                        val boss = found(s, tplBoss, thrBoss)
-                        val npc = !boss && found(s, tplNpc, thrNpc)
+                        val boss = foundAny(s, tplsBoss, thrBoss)
+                        val npc = !boss && foundAny(s, tplsNpc, thrNpc)
                         s.release()
                         if (boss) {
                             circleBoss(thrBoss)
                         } else if (npc && System.currentTimeMillis() - lastPet > 2000) {
-                            BotAccessibility.instance?.tap(petX, petY)
+                            BotAccessibility.instance?.tap(btnX, btnY)
                             lastPet = System.currentTimeMillis()
                         }
                         Thread.sleep(300)
@@ -347,30 +360,31 @@ jobs:
 
                 private fun circleBoss(thrBoss: Double) {
                     val cfg = getSharedPreferences("cfg", MODE_PRIVATE)
-                    val jx = cfg.getInt("joyX", 15) * w / 100
-                    val jy = cfg.getInt("joyY", 70) * h / 100
-                    val ax = cfg.getInt("atkX", 92) * w / 100
-                    val ay = cfg.getInt("atkY", 60) * h / 100
+                    val jx = (cfg.getFloat("joyFX", 15f) * w / 100f).toInt()
+                    val jy = (cfg.getFloat("joyFY", 70f) * h / 100f).toInt()
+                    val ax = (cfg.getFloat("btnFX", 90f) * w / 100f).toInt()
+                    val ay = (cfg.getFloat("btnFY", 70f) * h / 100f).toInt()
                     val r = cfg.getInt("radius", 90)
                     val fixed = cfg.getInt("fixed", 1) == 1
                     val maxMiss = cfg.getInt("bossMiss", 4)
+                    val attack = cfg.getInt("atkBoss", 0) == 1
                     var missing = 0
 
                     if (fixed) {
-                        // Mode FIXE : on tient le joystick dans une seule direction + attaque, jusqu'à la fin du boss
+                        // Mode FIXE : on tient le joystick dans une seule direction, jusqu'à la fin du boss
                         val rad = Math.toRadians(cfg.getInt("dir", 0).toDouble())
                         val tx = jx + (r * cos(rad)).toInt()
                         val ty = jy + (r * sin(rad)).toInt()
                         holding = true
                         val t = Thread {
-                            BotAccessibility.instance?.holdDirection(jx, jy, tx, ty, ax, ay) { holding && running }
+                            BotAccessibility.instance?.holdDirection(jx, jy, tx, ty, ax, ay, attack) { holding && running }
                         }
                         t.start()
                         while (running && missing < maxMiss) {
                             Thread.sleep(300)
                             val s = grab()
                             if (s != null) {
-                                if (found(s, tplBoss, thrBoss)) missing = 0 else missing++
+                                if (foundAny(s, tplsBoss, thrBoss)) missing = 0 else missing++
                                 s.release()
                             }
                         }
@@ -386,11 +400,11 @@ jobs:
                         val rad = Math.toRadians(angle)
                         val tx = jx + (r * cos(rad)).toInt()
                         val ty = jy + (r * sin(rad)).toInt()
-                        BotAccessibility.instance?.moveAndAttack(jx, jy, tx, ty, ax, ay, 300)
+                        BotAccessibility.instance?.moveAndAttack(jx, jy, tx, ty, ax, ay, 300, attack)
                         Thread.sleep(340)
                         val s = grab()
                         if (s != null) {
-                            if (found(s, tplBoss, thrBoss)) missing = 0 else missing++
+                            if (foundAny(s, tplsBoss, thrBoss)) missing = 0 else missing++
                             s.release()
                         }
                     }
@@ -402,6 +416,116 @@ jobs:
                     vd?.release()
                     reader?.close()
                     projection?.stop()
+                    super.onDestroy()
+                }
+            }
+            WCEOF
+            mkdir -p app/src/main/java/com/example/wcbot
+            cat > app/src/main/java/com/example/wcbot/CalibService.kt <<'WCEOF'
+            package com.example.wcbot
+
+            import android.app.Service
+            import android.content.Intent
+            import android.graphics.PixelFormat
+            import android.os.Build
+            import android.os.Handler
+            import android.os.IBinder
+            import android.os.Looper
+            import android.util.DisplayMetrics
+            import android.view.Gravity
+            import android.view.MotionEvent
+            import android.view.ViewGroup
+            import android.view.WindowManager
+            import android.widget.Button
+            import android.widget.FrameLayout
+            import android.widget.TextView
+            import android.widget.Toast
+
+            /** Affiche un voile par-dessus le jeu : on touche le joystick puis le bouton d'attaque, c'est enregistré. */
+            class CalibService : Service() {
+                private var wm: WindowManager? = null
+                private var root: FrameLayout? = null
+                private val handler = Handler(Looper.getMainLooper())
+                private val steps = listOf("Touchez le CENTRE du joystick de déplacement", "Touchez le bouton d'ATTAQUE")
+                private val keys = listOf("joy", "btn")
+                private var step = 0
+
+                override fun onBind(intent: Intent?): IBinder? = null
+
+                override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                    handler.postDelayed({ show() }, 12000)
+                    return START_NOT_STICKY
+                }
+
+                @Suppress("DEPRECATION")
+                private fun show() {
+                    val manager = getSystemService(WINDOW_SERVICE) as WindowManager
+                    wm = manager
+                    val dm = DisplayMetrics()
+                    manager.defaultDisplay.getRealMetrics(dm)
+                    val sw = dm.widthPixels.toFloat()
+                    val sh = dm.heightPixels.toFloat()
+
+                    val frame = FrameLayout(this)
+                    frame.setBackgroundColor(0x99000000.toInt())
+
+                    val label = TextView(this)
+                    label.text = steps[0]
+                    label.textSize = 24f
+                    label.setTextColor(0xFFFFFFFF.toInt())
+                    label.gravity = Gravity.CENTER
+                    val lpLabel = FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP
+                    )
+                    lpLabel.topMargin = 40
+                    frame.addView(label, lpLabel)
+
+                    val cancel = Button(this)
+                    cancel.text = "Annuler"
+                    cancel.setOnClickListener { stopSelf() }
+                    frame.addView(
+                        cancel,
+                        FrameLayout.LayoutParams(
+                            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                            Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+                        )
+                    )
+
+                    frame.setOnTouchListener { _, ev ->
+                        if (ev.action == MotionEvent.ACTION_DOWN) {
+                            val e = getSharedPreferences("cfg", MODE_PRIVATE).edit()
+                            e.putFloat(keys[step] + "FX", ev.rawX / sw * 100f)
+                            e.putFloat(keys[step] + "FY", ev.rawY / sh * 100f)
+                            e.apply()
+                            step++
+                            if (step >= steps.size) {
+                                Toast.makeText(this, "Positions enregistrées ✔", Toast.LENGTH_LONG).show()
+                                stopSelf()
+                            } else {
+                                label.text = steps[step]
+                            }
+                        }
+                        true
+                    }
+
+                    val lp = WindowManager.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
+                        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                        PixelFormat.TRANSLUCENT
+                    )
+                    if (Build.VERSION.SDK_INT >= 28) {
+                        lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                    }
+                    manager.addView(frame, lp)
+                    root = frame
+                }
+
+                override fun onDestroy() {
+                    handler.removeCallbacksAndMessages(null)
+                    try { root?.let { wm?.removeView(it) } } catch (e: Exception) {}
                     super.onDestroy()
                 }
             }
@@ -427,29 +551,22 @@ jobs:
             class MainActivity : Activity() {
                 private val fields = LinkedHashMap<String, EditText>()
                 private val defaults = linkedMapOf(
-                    "petX" to 88, "petY" to 75,
-                    "atkX" to 92, "atkY" to 60,
-                    "joyX" to 15, "joyY" to 70,
-                    "radius" to 90, "fixed" to 1, "dir" to 0, "bossMiss" to 4,
+                    "radius" to 90, "fixed" to 1, "dir" to 0, "bossMiss" to 4, "atkBoss" to 0,
                     "thrNpc" to 75, "thrBoss" to 75
                 )
                 private val labels = mapOf(
-                    "petX" to "Bouton attaque ANIMAL - X (% écran)",
-                    "petY" to "Bouton attaque ANIMAL - Y (% écran)",
-                    "atkX" to "Bouton attaque PERSO - X (% écran)",
-                    "atkY" to "Bouton attaque PERSO - Y (% écran)",
-                    "joyX" to "Centre du joystick - X (% écran)",
-                    "joyY" to "Centre du joystick - Y (% écran)",
                     "radius" to "Amplitude du joystick (pixels)",
                     "fixed" to "Joystick en mode FIXE (1 = fixe, 0 = libre)",
                     "dir" to "Direction tenue autour du boss en degrés (0=droite, 90=bas, 180=gauche, 270=haut)",
                     "bossMiss" to "Vérifications sans barre avant la fin du boss (1 = environ 0,3 s)",
+                    "atkBoss" to "Taper sur le bouton d'attaque pendant le tour du boss (1 = oui, 0 = non)",
                     "thrNpc" to "Sensibilité détection PNJ (%)",
                     "thrBoss" to "Sensibilité détection boss (%)"
                 )
                 private val PICK_NPC = 1
                 private val PICK_BOSS = 2
                 private val REQ_CAPTURE = 3
+                private var status: TextView? = null
 
                 override fun onCreate(savedInstanceState: Bundle?) {
                     super.onCreate(savedInstanceState)
@@ -468,17 +585,24 @@ jobs:
                     }
 
                     val title = TextView(this)
-                    title.text = "WildCraft Bot\n1) Autorisations  2) Images  3) Réglages  4) Démarrer"
+                    title.text = getString(R.string.app_name)
+                    title.textSize = 22f
                     box.addView(title)
+                    val st = TextView(this)
+                    box.addView(st)
+                    status = st
 
                     button("1a. Autoriser l'affichage par-dessus les applis") {
                         startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + packageName)))
                     }
-                    button("1b. Activer le service d'accessibilité (WildCraft Bot)") {
+                    button("1b. Activer le service d'accessibilité") {
                         startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
                     }
-                    button("2a. Choisir l'image du PNJ (capture rognée)") { pick(PICK_NPC) }
-                    button("2b. Choisir l'image de la barre de vie du boss") { pick(PICK_BOSS) }
+                    button("2a. Ajouter des images de PNJ (plusieurs possibles)") { pick(PICK_NPC) }
+                    button("2b. Ajouter des images de barre de vie de boss (plusieurs possibles)") { pick(PICK_BOSS) }
+                    button("Effacer les images de PNJ") { clear("npc_") }
+                    button("Effacer les images de boss") { clear("boss_") }
+                    button("3. Placer le joystick et le bouton d'attaque") { calibrate() }
 
                     for ((k, d) in defaults) {
                         val tv = TextView(this)
@@ -492,14 +616,47 @@ jobs:
                     }
 
                     button("4. DÉMARRER (puis ouvrez WildCraft)") { start() }
-                    button("Arrêter le bot") { stopService(Intent(this, BotService::class.java)) }
+                    button("Quitter le bot (retire le bouton flottant)") {
+                        stopService(Intent(this, BotService::class.java))
+                    }
                     setContentView(sv)
+                }
+
+                override fun onResume() {
+                    super.onResume()
+                    refreshStatus()
+                }
+
+                private fun count(prefix: String): Int =
+                    (filesDir.listFiles() ?: emptyArray()).count { it.name.startsWith(prefix) }
+
+                private fun refreshStatus() {
+                    val cfg = getSharedPreferences("cfg", MODE_PRIVATE)
+                    val ok = cfg.contains("joyFX") && cfg.contains("btnFX")
+                    status?.text = "Positions : " + (if (ok) "enregistrées ✔" else "pas encore placées") +
+                        "\nImages PNJ : " + count("npc_") + "   |   Images boss : " + count("boss_")
+                }
+
+                private fun clear(prefix: String) {
+                    (filesDir.listFiles() ?: emptyArray()).filter { it.name.startsWith(prefix) }.forEach { it.delete() }
+                    refreshStatus()
                 }
 
                 private fun pick(code: Int) {
                     val i = Intent(Intent.ACTION_GET_CONTENT)
                     i.type = "image/*"
+                    i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
                     startActivityForResult(i, code)
+                }
+
+                private fun calibrate() {
+                    if (!Settings.canDrawOverlays(this)) {
+                        Toast.makeText(this, "Autorisez d'abord l'affichage par-dessus les applis (1a)", Toast.LENGTH_LONG).show()
+                        return
+                    }
+                    startService(Intent(this, CalibService::class.java))
+                    Toast.makeText(this, "Ouvrez WildCraft : le réglage démarre dans 12 secondes", Toast.LENGTH_LONG).show()
+                    moveTaskToBack(true)
                 }
 
                 private fun save() {
@@ -509,6 +666,7 @@ jobs:
                 }
 
                 private fun start() {
+                    val cfg = getSharedPreferences("cfg", MODE_PRIVATE)
                     if (!Settings.canDrawOverlays(this)) {
                         Toast.makeText(this, "Autorisez d'abord l'affichage par-dessus les applis (1a)", Toast.LENGTH_LONG).show()
                         return
@@ -517,8 +675,12 @@ jobs:
                         Toast.makeText(this, "Activez d'abord le service d'accessibilité (1b)", Toast.LENGTH_LONG).show()
                         return
                     }
-                    if (!File(filesDir, "npc.png").exists() || !File(filesDir, "boss.png").exists()) {
-                        Toast.makeText(this, "Choisissez les deux images (2a et 2b)", Toast.LENGTH_LONG).show()
+                    if (!cfg.contains("joyFX") || !cfg.contains("btnFX")) {
+                        Toast.makeText(this, "Placez d'abord le joystick et le bouton d'attaque (3)", Toast.LENGTH_LONG).show()
+                        return
+                    }
+                    if (count("npc_") + count("boss_") == 0) {
+                        Toast.makeText(this, "Ajoutez au moins une image (2a ou 2b)", Toast.LENGTH_LONG).show()
                         return
                     }
                     save()
@@ -530,12 +692,24 @@ jobs:
                     super.onActivityResult(requestCode, resultCode, data)
                     if (resultCode != RESULT_OK || data == null) return
                     if (requestCode == PICK_NPC || requestCode == PICK_BOSS) {
-                        val uri = data.data ?: return
-                        val name = if (requestCode == PICK_NPC) "npc.png" else "boss.png"
-                        contentResolver.openInputStream(uri)?.use { input ->
-                            File(filesDir, name).outputStream().use { input.copyTo(it) }
+                        val uris = ArrayList<Uri>()
+                        val clip = data.clipData
+                        if (clip != null) {
+                            for (i in 0 until clip.itemCount) uris.add(clip.getItemAt(i).uri)
+                        } else {
+                            data.data?.let { uris.add(it) }
                         }
-                        Toast.makeText(this, "Image enregistrée", Toast.LENGTH_SHORT).show()
+                        val prefix = if (requestCode == PICK_NPC) "npc_" else "boss_"
+                        var n = 0
+                        for (u in uris) {
+                            contentResolver.openInputStream(u)?.use { input ->
+                                File(filesDir, prefix + System.currentTimeMillis() + "_" + n + ".img")
+                                    .outputStream().use { input.copyTo(it) }
+                            }
+                            n++
+                        }
+                        Toast.makeText(this, n.toString() + " image(s) ajoutée(s)", Toast.LENGTH_SHORT).show()
+                        refreshStatus()
                     } else if (requestCode == REQ_CAPTURE) {
                         val s = Intent(this, BotService::class.java)
                         s.putExtra("code", resultCode)
@@ -585,6 +759,15 @@ jobs:
             rootProject.name = "WildcraftBot"
             include(":app")
             WCEOF
+      - name: Personnaliser nom et icone
+        run: |
+          sed -i "s|<string name=\"app_name\">[^<]*</string>|<string name=\"app_name\">${APP_NAME}</string>|" app/src/main/res/values/strings.xml
+          if [ -f icon.png ]; then
+            mkdir -p app/src/main/res/mipmap-xxxhdpi
+            cp icon.png app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+            sed -i 's|<application|<application android:icon="@mipmap/ic_launcher"|' app/src/main/AndroidManifest.xml
+            echo "Icone personnalisee ajoutee"
+          fi
       - uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: '8.7'
@@ -594,5 +777,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: apk-${{ github.run_number }}
-          name: WildCraft Bot ${{ github.run_number }}
+          name: ${{ env.APP_NAME }} ${{ github.run_number }}
           files: app/build/outputs/apk/debug/app-debug.apk
