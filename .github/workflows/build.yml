@@ -719,7 +719,7 @@ jobs:
                         acc.tap(bx, by)
                         Thread.sleep(1500)
                         val end = System.currentTimeMillis() + 3000
-                        acc.holdDirection(jx, jy, tx, ty, false) { System.currentTimeMillis() < end }
+                        acc.holdDirection(jx, jy, tx, ty, bx, by, false) { System.currentTimeMillis() < end }
                     }.start()
                 }
 
