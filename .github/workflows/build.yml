@@ -296,20 +296,35 @@ jobs:
                     }
                 }
 
-                private fun found(screen: Mat, tpl: Mat?, thr: Double): Boolean {
-                    if (tpl == null || tpl.cols() > screen.cols() || tpl.rows() > screen.rows()) return false
+                private fun score(screen: Mat, tpl: Mat): Double {
+                    if (tpl.cols() > screen.cols() || tpl.rows() > screen.rows()) return 0.0
                     val res = Mat()
                     Imgproc.matchTemplate(screen, tpl, res, Imgproc.TM_CCOEFF_NORMED)
                     val best = Core.minMaxLoc(res).maxVal
                     res.release()
-                    return best >= thr
+                    return if (best.isNaN()) 0.0 else best
                 }
 
-                private fun foundAny(screen: Mat, tpls: List<Mat>, thr: Double): Boolean = tpls.any { found(screen, it, thr) }
+                private fun bestScore(screen: Mat, tpls: List<Mat>): Double {
+                    var best = 0.0
+                    for (t in tpls) {
+                        val sc = score(screen, t)
+                        if (sc > best) best = sc
+                    }
+                    return best
+                }
+
+                private fun fmt(d: Double): String = String.format("%.2f", d)
+
+                private fun setLabel(t: String) {
+                    overlay?.post { if (running) overlay?.text = t }
+                }
 
                 private fun showOverlay() {
                     val b = Button(this)
                     b.text = "▶"
+                    b.isAllCaps = false
+                    b.textSize = 12f
                     b.setOnClickListener { toggle() }
                     val lp = WindowManager.LayoutParams(
                         ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -342,12 +357,23 @@ jobs:
                     val thrNpc = cfg.getInt("thrNpc", 75) / 100.0
                     val thrBoss = cfg.getInt("thrBoss", 75) / 100.0
                     var lastPet = 0L
+                    var noImage = 0
                     while (running) {
                         val s = grab()
-                        if (s == null) { Thread.sleep(200); continue }
-                        val boss = foundAny(s, tplsBoss, thrBoss)
-                        val npc = !boss && foundAny(s, tplsNpc, thrNpc)
+                        if (s == null) {
+                            noImage++
+                            if (noImage == 10) setLabel("■ pas d'image reçue")
+                            Thread.sleep(200)
+                            continue
+                        }
+                        noImage = 0
+                        val sNpc = bestScore(s, tplsNpc)
+                        val sBoss = bestScore(s, tplsBoss)
                         s.release()
+                        val boss = sBoss >= thrBoss
+                        val npc = !boss && sNpc >= thrNpc
+                        val acc = if (BotAccessibility.instance == null) " | ACCESSIBILITE OFF" else ""
+                        setLabel("■ PNJ " + fmt(sNpc) + "/" + fmt(thrNpc) + " | Boss " + fmt(sBoss) + "/" + fmt(thrBoss) + acc)
                         if (boss) {
                             circleBoss(thrBoss)
                         } else if (npc && System.currentTimeMillis() - lastPet > 2000) {
@@ -371,7 +397,6 @@ jobs:
                     var missing = 0
 
                     if (fixed) {
-                        // Mode FIXE : on tient le joystick dans une seule direction, jusqu'à la fin du boss
                         val rad = Math.toRadians(cfg.getInt("dir", 0).toDouble())
                         val tx = jx + (r * cos(rad)).toInt()
                         val ty = jy + (r * sin(rad)).toInt()
@@ -384,8 +409,10 @@ jobs:
                             Thread.sleep(300)
                             val s = grab()
                             if (s != null) {
-                                if (foundAny(s, tplsBoss, thrBoss)) missing = 0 else missing++
+                                val sb = bestScore(s, tplsBoss)
                                 s.release()
+                                setLabel("■ BOSS en cours " + fmt(sb) + "/" + fmt(thrBoss))
+                                if (sb >= thrBoss) missing = 0 else missing++
                             }
                         }
                         holding = false
@@ -393,7 +420,6 @@ jobs:
                         return
                     }
 
-                    // Mode LIBRE : on fait tourner le joystick en cercle
                     var angle = 0.0
                     while (running && missing < maxMiss) {
                         angle = (angle + 25.0) % 360.0
@@ -404,8 +430,10 @@ jobs:
                         Thread.sleep(340)
                         val s = grab()
                         if (s != null) {
-                            if (foundAny(s, tplsBoss, thrBoss)) missing = 0 else missing++
+                            val sb = bestScore(s, tplsBoss)
                             s.release()
+                            setLabel("■ BOSS en cours " + fmt(sb) + "/" + fmt(thrBoss))
+                            if (sb >= thrBoss) missing = 0 else missing++
                         }
                     }
                 }
@@ -540,6 +568,7 @@ jobs:
             import android.net.Uri
             import android.os.Bundle
             import android.provider.Settings
+            import android.util.DisplayMetrics
             import android.widget.Button
             import android.widget.EditText
             import android.widget.LinearLayout
@@ -603,6 +632,7 @@ jobs:
                     button("Effacer les images de PNJ") { clear("npc_") }
                     button("Effacer les images de boss") { clear("boss_") }
                     button("3. Placer le joystick et le bouton d'attaque") { calibrate() }
+                    button("Test des gestes (dans 8 s : appui attaque, puis joystick tenu 3 s)") { testGestures() }
 
                     for ((k, d) in defaults) {
                         val tv = TextView(this)
@@ -657,6 +687,40 @@ jobs:
                     startService(Intent(this, CalibService::class.java))
                     Toast.makeText(this, "Ouvrez WildCraft : le réglage démarre dans 12 secondes", Toast.LENGTH_LONG).show()
                     moveTaskToBack(true)
+                }
+
+                @Suppress("DEPRECATION")
+                private fun testGestures() {
+                    val cfg = getSharedPreferences("cfg", MODE_PRIVATE)
+                    val acc = BotAccessibility.instance
+                    if (acc == null) {
+                        Toast.makeText(this, "Activez d'abord le service d'accessibilité (1b)", Toast.LENGTH_LONG).show()
+                        return
+                    }
+                    if (!cfg.contains("joyFX") || !cfg.contains("btnFX")) {
+                        Toast.makeText(this, "Placez d'abord le joystick et le bouton d'attaque (3)", Toast.LENGTH_LONG).show()
+                        return
+                    }
+                    save()
+                    val dm = DisplayMetrics()
+                    windowManager.defaultDisplay.getRealMetrics(dm)
+                    val jx = (cfg.getFloat("joyFX", 15f) * dm.widthPixels / 100f).toInt()
+                    val jy = (cfg.getFloat("joyFY", 70f) * dm.heightPixels / 100f).toInt()
+                    val bx = (cfg.getFloat("btnFX", 90f) * dm.widthPixels / 100f).toInt()
+                    val by = (cfg.getFloat("btnFY", 70f) * dm.heightPixels / 100f).toInt()
+                    val r = cfg.getInt("radius", 90)
+                    val rad = Math.toRadians(cfg.getInt("dir", 0).toDouble())
+                    val tx = jx + (r * Math.cos(rad)).toInt()
+                    val ty = jy + (r * Math.sin(rad)).toInt()
+                    Toast.makeText(this, "Ouvrez WildCraft : test dans 8 secondes", Toast.LENGTH_LONG).show()
+                    moveTaskToBack(true)
+                    Thread {
+                        Thread.sleep(8000)
+                        acc.tap(bx, by)
+                        Thread.sleep(1500)
+                        val end = System.currentTimeMillis() + 3000
+                        acc.holdDirection(jx, jy, tx, ty, false) { System.currentTimeMillis() < end }
+                    }.start()
                 }
 
                 private fun save() {
