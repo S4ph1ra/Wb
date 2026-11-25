@@ -42,6 +42,7 @@ jobs:
             }
             dependencies {
                 implementation("org.opencv:opencv:4.9.0")
+                implementation("com.google.mlkit:text-recognition:16.0.0")
             }
             WCEOF
             mkdir -p app/src/main
@@ -55,7 +56,7 @@ jobs:
 
                 <application
                     android:label="@string/app_name"
-                    android:theme="@android:style/Theme.Material.Light">
+                    android:theme="@android:style/Theme.Material.NoActionBar">
 
                     <activity
                         android:name=".MainActivity"
@@ -177,6 +178,8 @@ jobs:
             import android.graphics.Bitmap
             import android.graphics.BitmapFactory
             import android.graphics.PixelFormat
+            import android.graphics.Typeface
+            import android.graphics.drawable.GradientDrawable
             import android.hardware.display.DisplayManager
             import android.hardware.display.VirtualDisplay
             import android.media.ImageReader
@@ -191,10 +194,16 @@ jobs:
             import android.view.ViewGroup
             import android.view.WindowManager
             import android.widget.Button
+            import com.google.android.gms.tasks.Tasks
+            import com.google.mlkit.vision.common.InputImage
+            import com.google.mlkit.vision.text.TextRecognition
+            import com.google.mlkit.vision.text.TextRecognizer
+            import com.google.mlkit.vision.text.latin.TextRecognizerOptions
             import org.opencv.android.OpenCVLoader
             import org.opencv.android.Utils
             import org.opencv.core.Core
             import org.opencv.core.Mat
+            import org.opencv.core.Scalar
             import org.opencv.imgproc.Imgproc
             import java.io.File
             import kotlin.math.cos
@@ -208,15 +217,32 @@ jobs:
                 private var wm: WindowManager? = null
                 @Volatile private var running = false
                 @Volatile private var holding = false
+                @Volatile private var gen = 0
+                private var loopThread: Thread? = null
                 private var w = 0
                 private var h = 0
                 private var tplsNpc: List<Mat> = emptyList()
-                private var tplsBoss: List<Mat> = emptyList()
+                private var bossRefs: List<BossRef> = emptyList()
+
+                private class Frame(val rgba: Mat, val gray: Mat, val bmp: Bitmap) {
+                    fun release() { rgba.release(); gray.release() }
+                }
+
+                /** Nombre de vie lu à l'écran : vie actuelle, et vie max si le jeu affiche "actuelle/max". */
+                private class Hp(val cur: Long, val max: Long?)
+
+                private var recognizer: TextRecognizer? = null
+                private var lastRaw = ""
+
+                /** Couleur dominante d'une image de barre de vie + longueur (en pixels) de cette couleur. */
+                private class BossRef(val r: Int, val g: Int, val b: Int, val runLen: Int)
 
                 override fun onBind(intent: Intent?): IBinder? = null
 
                 override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                    if (intent?.action == "STOP") { stopSelf(); return START_NOT_STICKY }
                     startNotif()
+                    if (overlay != null) return START_NOT_STICKY
                     val code = intent?.getIntExtra("code", 0) ?: 0
                     val data = intent?.getParcelableExtra<Intent>("data")
                     if (data == null) { stopSelf(); return START_NOT_STICKY }
@@ -229,8 +255,9 @@ jobs:
                     }, Handler(Looper.getMainLooper()))
                     projection = p
                     setupCapture()
-                    tplsNpc = loadTemplates("npc_")
-                    tplsBoss = loadTemplates("boss_")
+                    recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+                    tplsNpc = loadNpcTemplates()
+                    bossRefs = loadBossRefs()
                     showOverlay()
                     return START_NOT_STICKY
                 }
@@ -239,7 +266,7 @@ jobs:
                     val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
                     nm.createNotificationChannel(NotificationChannel("bot", "Bot", NotificationManager.IMPORTANCE_LOW))
                     val n = Notification.Builder(this, "bot")
-                        .setContentTitle("WildCraft Bot actif")
+                        .setContentTitle("Bot actif")
                         .setSmallIcon(android.R.drawable.ic_media_play)
                         .build()
                     if (Build.VERSION.SDK_INT >= 29) {
@@ -262,10 +289,10 @@ jobs:
                     )
                 }
 
-                private fun loadTemplates(prefix: String): List<Mat> {
-                    val files = (filesDir.listFiles() ?: emptyArray()).filter { it.name.startsWith(prefix) }
-                    return files.mapNotNull { loadTemplate(it) }
-                }
+                private fun filesWithPrefix(prefix: String): List<File> =
+                    (filesDir.listFiles() ?: emptyArray()).filter { it.name.startsWith(prefix) }
+
+                private fun loadNpcTemplates(): List<Mat> = filesWithPrefix("npc_").mapNotNull { loadTemplate(it) }
 
                 private fun loadTemplate(f: File): Mat? {
                     val bmp = BitmapFactory.decodeFile(f.path) ?: return null
@@ -277,7 +304,39 @@ jobs:
                     return g
                 }
 
-                private fun grab(): Mat? {
+                private fun loadBossRefs(): List<BossRef> = filesWithPrefix("boss_").mapNotNull { bossRefOf(it) }
+
+                /** Cherche la couleur dominante de l'image (la partie colorée de la barre de vie). */
+                private fun bossRefOf(f: File): BossRef? {
+                    val bmp = BitmapFactory.decodeFile(f.path) ?: return null
+                    val wd = bmp.width
+                    val ht = bmp.height
+                    val px = IntArray(wd * ht)
+                    bmp.getPixels(px, 0, wd, 0, 0, wd, ht)
+                    val cnt = IntArray(512)
+                    for (p in px) {
+                        val r = (p shr 16) and 255
+                        val g = (p shr 8) and 255
+                        val b = p and 255
+                        cnt[(r / 32) * 64 + (g / 32) * 8 + (b / 32)]++
+                    }
+                    var best = 0
+                    for (i in 1 until 512) if (cnt[i] > cnt[best]) best = i
+                    var sr = 0L
+                    var sg = 0L
+                    var sb = 0L
+                    var n = 0
+                    for (p in px) {
+                        val r = (p shr 16) and 255
+                        val g = (p shr 8) and 255
+                        val b = p and 255
+                        if ((r / 32) * 64 + (g / 32) * 8 + (b / 32) == best) { sr += r; sg += g; sb += b; n++ }
+                    }
+                    if (n == 0) return null
+                    return BossRef((sr / n).toInt(), (sg / n).toInt(), (sb / n).toInt(), maxOf(6, n / ht))
+                }
+
+                private fun grab(): Frame? {
                     val img = reader?.acquireLatestImage() ?: return null
                     try {
                         val pl = img.planes[0]
@@ -289,8 +348,7 @@ jobs:
                         Utils.bitmapToMat(bmp, m)
                         val g = Mat()
                         Imgproc.cvtColor(m, g, Imgproc.COLOR_RGBA2GRAY)
-                        m.release()
-                        return g
+                        return Frame(m, g, bmp)
                     } finally {
                         img.close()
                     }
@@ -314,6 +372,81 @@ jobs:
                     return best
                 }
 
+                /** Plus longue ligne horizontale continue de pixels "allumés" dans le masque. */
+                private fun longestRun(mask: Mat): Int {
+                    val wd = mask.cols()
+                    val ht = mask.rows()
+                    val buf = ByteArray(wd * ht)
+                    mask.get(0, 0, buf)
+                    var best = 0
+                    for (y in 0 until ht) {
+                        var run = 0
+                        val off = y * wd
+                        for (x in 0 until wd) {
+                            if (buf[off + x].toInt() != 0) {
+                                run++
+                                if (run > best) best = run
+                            } else {
+                                run = 0
+                            }
+                        }
+                    }
+                    return best
+                }
+
+                /** 0 à 1 : part de la longueur de votre image de barre retrouvée à l'écran, en ligne continue, dans la même couleur. */
+                private fun bossScore(rgba: Mat, tol: Int): Double {
+                    if (bossRefs.isEmpty()) return 0.0
+                    var best = 0.0
+                    val mask = Mat()
+                    for (ref in bossRefs) {
+                        Core.inRange(
+                            rgba,
+                            Scalar((ref.r - tol).toDouble(), (ref.g - tol).toDouble(), (ref.b - tol).toDouble(), 0.0),
+                            Scalar((ref.r + tol).toDouble(), (ref.g + tol).toDouble(), (ref.b + tol).toDouble(), 255.0),
+                            mask
+                        )
+                        val sc = minOf(1.0, longestRun(mask).toDouble() / ref.runLen)
+                        if (sc > best) best = sc
+                    }
+                    mask.release()
+                    return best
+                }
+
+                private fun digitsOf(t: String): Long? {
+                    val d = t.filter { it.isDigit() }
+                    return if (d.isEmpty() || d.length > 12) null else d.toLong()
+                }
+
+                /** Lit le nombre de vie dans la zone réglée (reconnaissance de texte sur l'appareil, sans internet). */
+                private fun readHp(f: Frame): Hp? {
+                    try {
+                        val cfg = getSharedPreferences("cfg", MODE_PRIVATE)
+                        if (!cfg.contains("hp1FX") || !cfg.contains("hp2FX")) return null
+                        val x1 = (cfg.getFloat("hp1FX", 0f) * w / 100f).toInt().coerceIn(0, w - 2)
+                        val y1 = (cfg.getFloat("hp1FY", 0f) * h / 100f).toInt().coerceIn(0, h - 2)
+                        val x2 = (cfg.getFloat("hp2FX", 0f) * w / 100f).toInt().coerceIn(x1 + 1, w)
+                        val y2 = (cfg.getFloat("hp2FY", 0f) * h / 100f).toInt().coerceIn(y1 + 1, h)
+                        var crop = Bitmap.createBitmap(f.bmp, x1, y1, x2 - x1, y2 - y1)
+                        if (crop.height < 64) {
+                            val k = minOf(4, (64 + crop.height - 1) / crop.height)
+                            crop = Bitmap.createScaledBitmap(crop, crop.width * k, crop.height * k, true)
+                        }
+                        val rec = recognizer ?: return null
+                        val text = Tasks.await(rec.process(InputImage.fromBitmap(crop, 0))).text
+                        lastRaw = text.replace("\n", " ").trim()
+                        val line = text.lines().firstOrNull { l -> l.any { it.isDigit() || it == 'O' || it == 'o' || it == 'l' || it == 'I' } }
+                            ?: return null
+                        val fixed = line.replace('O', '0').replace('o', '0').replace('l', '1').replace('I', '1')
+                        val parts = fixed.split('/')
+                        val cur = digitsOf(parts[0]) ?: return null
+                        val max = if (parts.size > 1) digitsOf(parts[1]) else null
+                        return Hp(cur, max)
+                    } catch (e: Exception) {
+                        return null
+                    }
+                }
+
                 private fun fmt(d: Double): String = String.format("%.2f", d)
 
                 private fun setLabel(t: String) {
@@ -323,9 +456,20 @@ jobs:
                 private fun showOverlay() {
                     val b = Button(this)
                     b.text = "▶"
-                    b.isAllCaps = false
+                    val bg = GradientDrawable()
+                    bg.setColor(0xCC050A05.toInt())
+                    bg.setStroke(3, 0xFF00FF41.toInt())
+                    bg.cornerRadius = 14f
+                    b.background = bg
+                    b.setTextColor(0xFF00FF41.toInt())
+                    b.typeface = Typeface.MONOSPACE
+                    b.setAllCaps(false)
                     b.textSize = 12f
+                    b.minWidth = 0
+                    b.minHeight = 0
+                    b.setPadding(24, 10, 24, 10)
                     b.setOnClickListener { toggle() }
+                    b.setOnLongClickListener { stopSelf(); true }
                     val lp = WindowManager.LayoutParams(
                         ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
                         WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
@@ -342,40 +486,109 @@ jobs:
                 private fun toggle() {
                     if (running) {
                         running = false
+                        gen++
                         overlay?.text = "▶"
                     } else {
+                        gen++
+                        val g = gen
                         running = true
                         overlay?.text = "■"
-                        Thread { loop() }.start()
+                        val t = Thread { try { if (getSharedPreferences("cfg", MODE_PRIVATE).getInt("ocr", 1) == 1) loopOcr(g) else loopImages(g) } catch (e: Exception) {} }
+                        loopThread = t
+                        t.start()
                     }
                 }
 
-                private fun loop() {
+                private fun active(g: Int): Boolean = running && gen == g
+
+                /** Méthode 1 : lecture du nombre de vie. Au-dessus du seuil = boss, en dessous = PNJ. */
+                private fun loopOcr(g: Int) {
                     val cfg = getSharedPreferences("cfg", MODE_PRIVATE)
                     val btnX = (cfg.getFloat("btnFX", 90f) * w / 100f).toInt()
                     val btnY = (cfg.getFloat("btnFY", 70f) * h / 100f).toInt()
-                    val thrNpc = cfg.getInt("thrNpc", 75) / 100.0
-                    val thrBoss = cfg.getInt("thrBoss", 75) / 100.0
+                    val hpBoss = cfg.getInt("hpBoss", 10000).toLong()
                     var lastPet = 0L
                     var noImage = 0
-                    while (running) {
-                        val s = grab()
-                        if (s == null) {
+                    while (active(g)) {
+                        val f = grab()
+                        if (f == null) {
                             noImage++
                             if (noImage == 10) setLabel("■ pas d'image reçue")
                             Thread.sleep(200)
                             continue
                         }
                         noImage = 0
-                        val sNpc = bestScore(s, tplsNpc)
-                        val sBoss = bestScore(s, tplsBoss)
-                        s.release()
+                        val hp = readHp(f)
+                        f.release()
+                        if (hp == null) {
+                            setLabel("■ aucun nombre lu (" + lastRaw.take(14) + ")")
+                            Thread.sleep(300)
+                            continue
+                        }
+                        val ref = hp.max ?: hp.cur
+                        val acc = if (BotAccessibility.instance == null) " | ACCESSIBILITE OFF" else ""
+                        val kind = if (ref >= hpBoss) "BOSS" else "PNJ"
+                        setLabel("■ vie " + hp.cur + (if (hp.max != null) "/" + hp.max else "") + " → " + kind + acc)
+                        if (hp.cur > 0) {
+                            if (ref >= hpBoss) {
+                                circleBoss(g) {
+                                    val f2 = grab()
+                                    if (f2 == null) {
+                                        null
+                                    } else {
+                                        val h2 = readHp(f2)
+                                        f2.release()
+                                        setLabel("■ BOSS vie " + (if (h2 != null) h2.cur.toString() else "?"))
+                                        h2 != null && h2.cur > 0
+                                    }
+                                }
+                            } else if (System.currentTimeMillis() - lastPet > 2000) {
+                                BotAccessibility.instance?.tap(btnX, btnY)
+                                lastPet = System.currentTimeMillis()
+                            }
+                        }
+                        Thread.sleep(300)
+                    }
+                }
+
+                /** Méthode 0 : reconnaissance par images (PNJ) et par couleur de barre (boss). */
+                private fun loopImages(g: Int) {
+                    val cfg = getSharedPreferences("cfg", MODE_PRIVATE)
+                    val btnX = (cfg.getFloat("btnFX", 90f) * w / 100f).toInt()
+                    val btnY = (cfg.getFloat("btnFY", 70f) * h / 100f).toInt()
+                    val thrNpc = cfg.getInt("thrNpc", 75) / 100.0
+                    val thrBoss = cfg.getInt("thrBoss", 75) / 100.0
+                    val tol = cfg.getInt("tolColor", 35)
+                    var lastPet = 0L
+                    var noImage = 0
+                    while (active(g)) {
+                        val f = grab()
+                        if (f == null) {
+                            noImage++
+                            if (noImage == 10) setLabel("■ pas d'image reçue")
+                            Thread.sleep(200)
+                            continue
+                        }
+                        noImage = 0
+                        val sNpc = bestScore(f.gray, tplsNpc)
+                        val sBoss = bossScore(f.rgba, tol)
+                        f.release()
                         val boss = sBoss >= thrBoss
                         val npc = !boss && sNpc >= thrNpc
                         val acc = if (BotAccessibility.instance == null) " | ACCESSIBILITE OFF" else ""
                         setLabel("■ PNJ " + fmt(sNpc) + "/" + fmt(thrNpc) + " | Boss " + fmt(sBoss) + "/" + fmt(thrBoss) + acc)
                         if (boss) {
-                            circleBoss(thrBoss)
+                            circleBoss(g) {
+                                val f2 = grab()
+                                if (f2 == null) {
+                                    null
+                                } else {
+                                    val sb = bossScore(f2.rgba, tol)
+                                    f2.release()
+                                    setLabel("■ BOSS en cours " + fmt(sb) + "/" + fmt(thrBoss))
+                                    sb >= thrBoss
+                                }
+                            }
                         } else if (npc && System.currentTimeMillis() - lastPet > 2000) {
                             BotAccessibility.instance?.tap(btnX, btnY)
                             lastPet = System.currentTimeMillis()
@@ -384,7 +597,8 @@ jobs:
                     }
                 }
 
-                private fun circleBoss(thrBoss: Double) {
+                /** Tourne autour du boss tant que alive() renvoie true (null = pas d'information, on ne change rien). */
+                private fun circleBoss(g: Int, alive: () -> Boolean?) {
                     val cfg = getSharedPreferences("cfg", MODE_PRIVATE)
                     val jx = (cfg.getFloat("joyFX", 15f) * w / 100f).toInt()
                     val jy = (cfg.getFloat("joyFY", 70f) * h / 100f).toInt()
@@ -402,18 +616,15 @@ jobs:
                         val ty = jy + (r * sin(rad)).toInt()
                         holding = true
                         val t = Thread {
-                            BotAccessibility.instance?.holdDirection(jx, jy, tx, ty, ax, ay, attack) { holding && running }
+                            try {
+                                BotAccessibility.instance?.holdDirection(jx, jy, tx, ty, ax, ay, attack) { holding && active(g) }
+                            } catch (e: Exception) {}
                         }
                         t.start()
-                        while (running && missing < maxMiss) {
+                        while (active(g) && missing < maxMiss) {
                             Thread.sleep(300)
-                            val s = grab()
-                            if (s != null) {
-                                val sb = bestScore(s, tplsBoss)
-                                s.release()
-                                setLabel("■ BOSS en cours " + fmt(sb) + "/" + fmt(thrBoss))
-                                if (sb >= thrBoss) missing = 0 else missing++
-                            }
+                            val a = alive()
+                            if (a == true) missing = 0 else if (a == false) missing++
                         }
                         holding = false
                         t.join(3000)
@@ -421,29 +632,28 @@ jobs:
                     }
 
                     var angle = 0.0
-                    while (running && missing < maxMiss) {
+                    while (active(g) && missing < maxMiss) {
                         angle = (angle + 25.0) % 360.0
                         val rad = Math.toRadians(angle)
                         val tx = jx + (r * cos(rad)).toInt()
                         val ty = jy + (r * sin(rad)).toInt()
                         BotAccessibility.instance?.moveAndAttack(jx, jy, tx, ty, ax, ay, 300, attack)
                         Thread.sleep(340)
-                        val s = grab()
-                        if (s != null) {
-                            val sb = bestScore(s, tplsBoss)
-                            s.release()
-                            setLabel("■ BOSS en cours " + fmt(sb) + "/" + fmt(thrBoss))
-                            if (sb >= thrBoss) missing = 0 else missing++
-                        }
+                        val a = alive()
+                        if (a == true) missing = 0 else if (a == false) missing++
                     }
                 }
 
                 override fun onDestroy() {
                     running = false
+                    holding = false
+                    gen++
+                    try { loopThread?.join(1500) } catch (e: Exception) {}
                     try { overlay?.let { wm?.removeView(it) } } catch (e: Exception) {}
-                    vd?.release()
-                    reader?.close()
-                    projection?.stop()
+                    try { vd?.release() } catch (e: Exception) {}
+                    try { reader?.close() } catch (e: Exception) {}
+                    try { projection?.stop() } catch (e: Exception) {}
+                    try { recognizer?.close() } catch (e: Exception) {}
                     super.onDestroy()
                 }
             }
@@ -455,6 +665,7 @@ jobs:
             import android.app.Service
             import android.content.Intent
             import android.graphics.PixelFormat
+            import android.graphics.Typeface
             import android.os.Build
             import android.os.Handler
             import android.os.IBinder
@@ -469,18 +680,32 @@ jobs:
             import android.widget.TextView
             import android.widget.Toast
 
-            /** Affiche un voile par-dessus le jeu : on touche le joystick puis le bouton d'attaque, c'est enregistré. */
+            /** Voile par-dessus le jeu : on touche les endroits demandés, ils sont enregistrés (en % de l'écran). */
             class CalibService : Service() {
                 private var wm: WindowManager? = null
                 private var root: FrameLayout? = null
                 private val handler = Handler(Looper.getMainLooper())
-                private val steps = listOf("Touchez le CENTRE du joystick de déplacement", "Touchez le bouton d'ATTAQUE")
-                private val keys = listOf("joy", "btn")
+                private var steps: List<String> = emptyList()
+                private var keys: List<String> = emptyList()
+                private var done = ""
                 private var step = 0
 
                 override fun onBind(intent: Intent?): IBinder? = null
 
                 override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                    if (intent?.getStringExtra("mode") == "zone") {
+                        steps = listOf(
+                            "Touchez le coin HAUT-GAUCHE de la zone du nombre de vie",
+                            "Touchez le coin BAS-DROIT de cette zone (autour du nombre seulement)"
+                        )
+                        keys = listOf("hp1", "hp2")
+                        done = "Zone du nombre de vie enregistrée ✔"
+                    } else {
+                        steps = listOf("Touchez le CENTRE du joystick de déplacement", "Touchez le bouton d'ATTAQUE")
+                        keys = listOf("joy", "btn")
+                        done = "Positions enregistrées ✔"
+                    }
+                    step = 0
                     handler.postDelayed({ show() }, 12000)
                     return START_NOT_STICKY
                 }
@@ -495,17 +720,17 @@ jobs:
                     val sh = dm.heightPixels.toFloat()
 
                     val frame = FrameLayout(this)
-                    frame.setBackgroundColor(0x99000000.toInt())
+                    frame.setBackgroundColor(0xCC000000.toInt())
 
                     val label = TextView(this)
                     label.text = steps[0]
                     label.textSize = 24f
-                    label.setTextColor(0xFFFFFFFF.toInt())
+                    label.setTextColor(0xFF00FF41.toInt())
+                    label.typeface = Typeface.MONOSPACE
                     label.gravity = Gravity.CENTER
                     val lpLabel = FrameLayout.LayoutParams(
-                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER
                     )
-                    lpLabel.topMargin = 40
                     frame.addView(label, lpLabel)
 
                     val cancel = Button(this)
@@ -527,7 +752,7 @@ jobs:
                             e.apply()
                             step++
                             if (step >= steps.size) {
-                                Toast.makeText(this, "Positions enregistrées ✔", Toast.LENGTH_LONG).show()
+                                Toast.makeText(this, done, Toast.LENGTH_LONG).show()
                                 stopSelf()
                             } else {
                                 label.text = steps[step]
@@ -564,11 +789,15 @@ jobs:
 
             import android.app.Activity
             import android.content.Intent
+            import android.graphics.Typeface
+            import android.graphics.drawable.GradientDrawable
             import android.media.projection.MediaProjectionManager
             import android.net.Uri
             import android.os.Bundle
             import android.provider.Settings
             import android.util.DisplayMetrics
+            import android.view.Gravity
+            import android.view.ViewGroup
             import android.widget.Button
             import android.widget.EditText
             import android.widget.LinearLayout
@@ -578,77 +807,138 @@ jobs:
             import java.io.File
 
             class MainActivity : Activity() {
+                private val GREEN = 0xFF00FF41.toInt()
+                private val DIM = 0xFF00B34A.toInt()
+                private val SOFT = 0xFF9FE8B4.toInt()
+                private val BG = 0xFF050A05.toInt()
+                private val PANEL = 0xFF0D1A0D.toInt()
+
                 private val fields = LinkedHashMap<String, EditText>()
                 private val defaults = linkedMapOf(
-                    "radius" to 90, "fixed" to 1, "dir" to 0, "bossMiss" to 4, "atkBoss" to 0,
-                    "thrNpc" to 75, "thrBoss" to 75
+                    "ocr" to 1, "hpBoss" to 10000, "radius" to 90, "fixed" to 1, "dir" to 0, "bossMiss" to 4, "atkBoss" to 0,
+                    "tolColor" to 35, "thrNpc" to 75, "thrBoss" to 75
                 )
                 private val labels = mapOf(
+                    "ocr" to "Méthode : 1 = lire le nombre de vie (recommandé), 0 = reconnaissance par images",
+                    "hpBoss" to "Vie à partir de laquelle c'est un BOSS (ex : 10000)",
                     "radius" to "Amplitude du joystick (pixels)",
                     "fixed" to "Joystick en mode FIXE (1 = fixe, 0 = libre)",
-                    "dir" to "Direction tenue autour du boss en degrés (0=droite, 90=bas, 180=gauche, 270=haut)",
+                    "dir" to "Direction tenue autour du boss, en degrés (0=droite, 90=bas, 180=gauche, 270=haut)",
                     "bossMiss" to "Vérifications sans barre avant la fin du boss (1 = environ 0,3 s)",
                     "atkBoss" to "Taper sur le bouton d'attaque pendant le tour du boss (1 = oui, 0 = non)",
-                    "thrNpc" to "Sensibilité détection PNJ (%)",
-                    "thrBoss" to "Sensibilité détection boss (%)"
+                    "tolColor" to "Boss : tolérance sur la couleur de la barre (plus grand = plus souple)",
+                    "thrNpc" to "PNJ : sensibilité de détection (%)",
+                    "thrBoss" to "Boss : part de la longueur de votre image de barre à retrouver (%)"
                 )
                 private val PICK_NPC = 1
                 private val PICK_BOSS = 2
                 private val REQ_CAPTURE = 3
                 private var status: TextView? = null
 
+                private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+                private fun styled(b: Button) {
+                    val d = GradientDrawable()
+                    d.setColor(PANEL)
+                    d.setStroke(dp(1) + 1, GREEN)
+                    d.cornerRadius = dp(6).toFloat()
+                    b.background = d
+                    b.setTextColor(GREEN)
+                    b.typeface = Typeface.MONOSPACE
+                    b.setAllCaps(false)
+                    b.textSize = 14f
+                    b.gravity = Gravity.START or Gravity.CENTER_VERTICAL
+                    b.setPadding(dp(14), dp(10), dp(14), dp(10))
+                }
+
                 override fun onCreate(savedInstanceState: Bundle?) {
                     super.onCreate(savedInstanceState)
+                    window.statusBarColor = BG
+                    window.navigationBarColor = BG
                     val prefs = getSharedPreferences("cfg", MODE_PRIVATE)
                     val sv = ScrollView(this)
+                    sv.setBackgroundColor(BG)
                     val box = LinearLayout(this)
                     box.orientation = LinearLayout.VERTICAL
-                    box.setPadding(40, 40, 40, 40)
+                    box.setPadding(dp(18), dp(18), dp(18), dp(30))
                     sv.addView(box)
+
+                    fun lp(top: Int): LinearLayout.LayoutParams {
+                        val l = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                        l.topMargin = dp(top)
+                        return l
+                    }
+
+                    fun text(t: String, color: Int, size: Float, top: Int): TextView {
+                        val tv = TextView(this)
+                        tv.text = t
+                        tv.setTextColor(color)
+                        tv.typeface = Typeface.MONOSPACE
+                        tv.textSize = size
+                        box.addView(tv, lp(top))
+                        return tv
+                    }
+
+                    fun header(t: String) { text("// " + t, DIM, 13f, 24) }
 
                     fun button(t: String, action: () -> Unit) {
                         val b = Button(this)
                         b.text = t
+                        styled(b)
                         b.setOnClickListener { action() }
-                        box.addView(b)
+                        box.addView(b, lp(8))
                     }
 
-                    val title = TextView(this)
-                    title.text = getString(R.string.app_name)
-                    title.textSize = 22f
-                    box.addView(title)
-                    val st = TextView(this)
-                    box.addView(st)
+                    text("> " + getString(R.string.app_name).uppercase() + "_", GREEN, 24f, 0)
+                    val st = text("", GREEN, 13f, 12)
+                    st.setBackgroundColor(PANEL)
+                    st.setPadding(dp(12), dp(10), dp(12), dp(10))
                     status = st
 
+                    header("01  AUTORISATIONS")
                     button("1a. Autoriser l'affichage par-dessus les applis") {
                         startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + packageName)))
                     }
                     button("1b. Activer le service d'accessibilité") {
                         startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
                     }
-                    button("2a. Ajouter des images de PNJ (plusieurs possibles)") { pick(PICK_NPC) }
-                    button("2b. Ajouter des images de barre de vie de boss (plusieurs possibles)") { pick(PICK_BOSS) }
+
+                    header("02  CIBLES PAR IMAGES  (inutile si Méthode = 1)")
+                    text(
+                        "PNJ : choisissez des images rognées du PNJ (son nom ou une icône).\n" +
+                            "BOSS : on ne cherche pas le boss lui-même, mais SA BARRE DE VIE. Rognez dans une capture un petit " +
+                            "rectangle de la partie COLORÉE de la barre (sans bord ni fond), puis choisissez-le ici.\n" +
+                            "Si la barre change de couleur avec la vie, ajoutez une image par couleur.",
+                        SOFT, 12f, 6
+                    )
+                    button("2a. PNJ  : ajouter des images") { pick(PICK_NPC) }
+                    button("2b. BOSS : ajouter des images de barre de vie") { pick(PICK_BOSS) }
                     button("Effacer les images de PNJ") { clear("npc_") }
                     button("Effacer les images de boss") { clear("boss_") }
-                    button("3. Placer le joystick et le bouton d'attaque") { calibrate() }
+
+                    header("03  POSITIONS")
+                    button("3a. Placer le joystick et le bouton d'attaque") { calibrate("buttons") }
+                    button("3b. Placer la zone du nombre de vie (ciblez un monstre avant)") { calibrate("zone") }
                     button("Test des gestes (dans 8 s : appui attaque, puis joystick tenu 3 s)") { testGestures() }
 
+                    header("04  REGLAGES")
                     for ((k, d) in defaults) {
-                        val tv = TextView(this)
-                        tv.text = labels[k]
-                        box.addView(tv)
+                        text(labels[k] ?: k, DIM, 12f, 12)
                         val et = EditText(this)
                         et.setText(prefs.getInt(k, d).toString())
                         et.inputType = android.text.InputType.TYPE_CLASS_NUMBER
-                        box.addView(et)
+                        et.setTextColor(GREEN)
+                        et.typeface = Typeface.MONOSPACE
+                        et.setBackgroundColor(PANEL)
+                        et.setPadding(dp(12), dp(8), dp(12), dp(8))
+                        box.addView(et, lp(4))
                         fields[k] = et
                     }
 
-                    button("4. DÉMARRER (puis ouvrez WildCraft)") { start() }
-                    button("Quitter le bot (retire le bouton flottant)") {
-                        stopService(Intent(this, BotService::class.java))
-                    }
+                    header("05  LANCEMENT")
+                    button("4. DEMARRER  (puis ouvrez WildCraft)") { start() }
+                    button("[ QUITTER LE BOT ]") { quitBot() }
+                    text("Astuce : un appui long sur le bouton flottant quitte aussi le bot.", SOFT, 12f, 10)
                     setContentView(sv)
                 }
 
@@ -663,13 +953,22 @@ jobs:
                 private fun refreshStatus() {
                     val cfg = getSharedPreferences("cfg", MODE_PRIVATE)
                     val ok = cfg.contains("joyFX") && cfg.contains("btnFX")
-                    status?.text = "Positions : " + (if (ok) "enregistrées ✔" else "pas encore placées") +
-                        "\nImages PNJ : " + count("npc_") + "   |   Images boss : " + count("boss_")
+                    status?.text = "[positions]  " + (if (ok) "OK" else "a placer") +
+                        "\n[zone de vie]  " + (if (cfg.contains("hp1FX") && cfg.contains("hp2FX")) "OK" else "a placer") +
+                        "\n[images PNJ]  " + count("npc_") + "\n[images BOSS] " + count("boss_") +
+                        "\n[accessibilite] " + (if (BotAccessibility.instance != null) "ON" else "OFF")
                 }
 
                 private fun clear(prefix: String) {
                     (filesDir.listFiles() ?: emptyArray()).filter { it.name.startsWith(prefix) }.forEach { it.delete() }
                     refreshStatus()
+                }
+
+                private fun quitBot() {
+                    val s = Intent(this, BotService::class.java)
+                    s.action = "STOP"
+                    startService(s)
+                    Toast.makeText(this, "Bot arrêté", Toast.LENGTH_SHORT).show()
                 }
 
                 private fun pick(code: Int) {
@@ -679,12 +978,14 @@ jobs:
                     startActivityForResult(i, code)
                 }
 
-                private fun calibrate() {
+                private fun calibrate(mode: String) {
                     if (!Settings.canDrawOverlays(this)) {
                         Toast.makeText(this, "Autorisez d'abord l'affichage par-dessus les applis (1a)", Toast.LENGTH_LONG).show()
                         return
                     }
-                    startService(Intent(this, CalibService::class.java))
+                    val cs = Intent(this, CalibService::class.java)
+                    cs.putExtra("mode", mode)
+                    startService(cs)
                     Toast.makeText(this, "Ouvrez WildCraft : le réglage démarre dans 12 secondes", Toast.LENGTH_LONG).show()
                     moveTaskToBack(true)
                 }
@@ -698,7 +999,7 @@ jobs:
                         return
                     }
                     if (!cfg.contains("joyFX") || !cfg.contains("btnFX")) {
-                        Toast.makeText(this, "Placez d'abord le joystick et le bouton d'attaque (3)", Toast.LENGTH_LONG).show()
+                        Toast.makeText(this, "Placez d'abord le joystick et le bouton d'attaque (3a)", Toast.LENGTH_LONG).show()
                         return
                     }
                     save()
@@ -715,11 +1016,13 @@ jobs:
                     Toast.makeText(this, "Ouvrez WildCraft : test dans 8 secondes", Toast.LENGTH_LONG).show()
                     moveTaskToBack(true)
                     Thread {
-                        Thread.sleep(8000)
-                        acc.tap(bx, by)
-                        Thread.sleep(1500)
-                        val end = System.currentTimeMillis() + 3000
-                        acc.holdDirection(jx, jy, tx, ty, bx, by, false) { System.currentTimeMillis() < end }
+                        try {
+                            Thread.sleep(8000)
+                            acc.tap(bx, by)
+                            Thread.sleep(1500)
+                            val end = System.currentTimeMillis() + 3000
+                            acc.holdDirection(jx, jy, tx, ty, bx, by, false) { System.currentTimeMillis() < end }
+                        } catch (e: Exception) {}
                     }.start()
                 }
 
@@ -740,10 +1043,16 @@ jobs:
                         return
                     }
                     if (!cfg.contains("joyFX") || !cfg.contains("btnFX")) {
-                        Toast.makeText(this, "Placez d'abord le joystick et le bouton d'attaque (3)", Toast.LENGTH_LONG).show()
+                        Toast.makeText(this, "Placez d'abord le joystick et le bouton d'attaque (3a)", Toast.LENGTH_LONG).show()
                         return
                     }
-                    if (count("npc_") + count("boss_") == 0) {
+                    val ocr = (fields["ocr"]?.text?.toString()?.toIntOrNull() ?: 1) == 1
+                    if (ocr) {
+                        if (!cfg.contains("hp1FX") || !cfg.contains("hp2FX")) {
+                            Toast.makeText(this, "Placez d'abord la zone du nombre de vie (3b)", Toast.LENGTH_LONG).show()
+                            return
+                        }
+                    } else if (count("npc_") + count("boss_") == 0) {
                         Toast.makeText(this, "Ajoutez au moins une image (2a ou 2b)", Toast.LENGTH_LONG).show()
                         return
                     }
