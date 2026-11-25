@@ -61,6 +61,8 @@ jobs:
                     <activity
                         android:name=".MainActivity"
                         android:exported="true"
+                        android:resizeableActivity="true"
+                        android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden"
                         android:screenOrientation="landscape">
                         <intent-filter>
                             <action android:name="android.intent.action.MAIN" />
@@ -191,9 +193,13 @@ jobs:
             import android.os.Looper
             import android.util.DisplayMetrics
             import android.view.Gravity
+            import android.view.MotionEvent
+            import android.view.View
             import android.view.ViewGroup
             import android.view.WindowManager
             import android.widget.Button
+            import android.widget.LinearLayout
+            import android.widget.TextView
             import com.google.android.gms.tasks.Tasks
             import com.google.mlkit.vision.common.InputImage
             import com.google.mlkit.vision.text.TextRecognition
@@ -206,6 +212,7 @@ jobs:
             import org.opencv.core.Scalar
             import org.opencv.imgproc.Imgproc
             import java.io.File
+            import kotlin.math.abs
             import kotlin.math.cos
             import kotlin.math.sin
 
@@ -214,6 +221,9 @@ jobs:
                 private var reader: ImageReader? = null
                 private var vd: VirtualDisplay? = null
                 private var overlay: Button? = null
+                private var boxOv: LinearLayout? = null
+                private var lpOv: WindowManager.LayoutParams? = null
+                private var mainBg: GradientDrawable? = null
                 private var wm: WindowManager? = null
                 @Volatile private var running = false
                 @Volatile private var holding = false
@@ -450,26 +460,196 @@ jobs:
                 private fun fmt(d: Double): String = String.format("%.2f", d)
 
                 private fun setLabel(t: String) {
-                    overlay?.post { if (running) overlay?.text = t }
+                    overlay?.post {
+                        if (running) {
+                            overlay?.text = t
+                            mainBg?.setStroke(3, if (t.contains("BOSS")) 0xFFFFB000.toInt() else 0xFF00FF41.toInt())
+                        }
+                    }
                 }
 
-                private fun showOverlay() {
+                private fun pill(color: Int, fill: Int): GradientDrawable {
+                    val d = GradientDrawable()
+                    d.setColor(fill)
+                    d.setStroke(3, color)
+                    d.cornerRadius = 14f
+                    return d
+                }
+
+                private fun smallButton(t: String): Button {
                     val b = Button(this)
-                    b.text = "▶"
-                    val bg = GradientDrawable()
-                    bg.setColor(0xCC050A05.toInt())
-                    bg.setStroke(3, 0xFF00FF41.toInt())
-                    bg.cornerRadius = 14f
-                    b.background = bg
-                    b.setTextColor(0xFF00FF41.toInt())
-                    b.typeface = Typeface.MONOSPACE
+                    b.text = t
                     b.setAllCaps(false)
+                    b.typeface = Typeface.MONOSPACE
                     b.textSize = 12f
                     b.minWidth = 0
                     b.minHeight = 0
                     b.setPadding(24, 10, 24, 10)
-                    b.setOnClickListener { toggle() }
-                    b.setOnLongClickListener { stopSelf(); true }
+                    b.setTextColor(0xFF00FF41.toInt())
+                    b.background = pill(0xFF00FF41.toInt(), 0xCC050A05.toInt())
+                    return b
+                }
+
+                private fun panelLabel(t: String): TextView {
+                    val tv = TextView(this)
+                    tv.text = t
+                    tv.typeface = Typeface.MONOSPACE
+                    tv.textSize = 12f
+                    tv.setTextColor(0xFF19D3FF.toInt())
+                    return tv
+                }
+
+                private fun topMargin(px: Int): LinearLayout.LayoutParams {
+                    val l = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                    l.topMargin = px
+                    return l
+                }
+
+                private fun stepper(name: String, key: String, def: Int, step: Int, min: Int, max: Int, wrap: Boolean): LinearLayout {
+                    val cfg = getSharedPreferences("cfg", MODE_PRIVATE)
+                    val row = LinearLayout(this)
+                    row.orientation = LinearLayout.HORIZONTAL
+                    row.gravity = Gravity.CENTER_VERTICAL
+                    val tv = panelLabel(name)
+                    tv.setTextColor(0xFF9FE8B4.toInt())
+                    tv.minWidth = 220
+                    val value = TextView(this)
+                    value.typeface = Typeface.MONOSPACE
+                    value.textSize = 13f
+                    value.setTextColor(0xFF00FF41.toInt())
+                    value.gravity = Gravity.CENTER
+                    value.minWidth = 120
+                    value.text = cfg.getInt(key, def).toString()
+                    val minus = smallButton("−")
+                    val plus = smallButton("+")
+                    fun change(delta: Int) {
+                        var v = cfg.getInt(key, def) + delta
+                        if (wrap) {
+                            if (v < min) v = max
+                            if (v > max) v = min
+                        } else {
+                            v = v.coerceIn(min, max)
+                        }
+                        cfg.edit().putInt(key, v).apply()
+                        value.text = v.toString()
+                    }
+                    minus.setOnClickListener { change(-step) }
+                    plus.setOnClickListener { change(step) }
+                    row.addView(tv)
+                    row.addView(minus)
+                    row.addView(value)
+                    row.addView(plus)
+                    return row
+                }
+
+                private fun toggleRow(name: String, key: String, onT: String, offT: String, def: Int): Button {
+                    val cfg = getSharedPreferences("cfg", MODE_PRIVATE)
+                    val b = smallButton("")
+                    fun refresh() { b.text = name + " : " + (if (cfg.getInt(key, def) == 1) onT else offT) }
+                    refresh()
+                    b.setOnClickListener {
+                        cfg.edit().putInt(key, if (cfg.getInt(key, def) == 1) 0 else 1).apply()
+                        refresh()
+                    }
+                    return b
+                }
+
+                private fun buildPanel(): LinearLayout {
+                    val p = LinearLayout(this)
+                    p.orientation = LinearLayout.VERTICAL
+                    p.setPadding(24, 18, 24, 18)
+                    val bg = GradientDrawable()
+                    bg.setColor(0xEE050A05.toInt())
+                    bg.setStroke(3, 0xFF00FF41.toInt())
+                    bg.cornerRadius = 16f
+                    p.background = bg
+                    p.addView(panelLabel("// REGLAGES EN JEU (effet au prochain boss)"))
+                    p.addView(stepper("Direction (°)", "dir", 0, 15, 0, 345, true), topMargin(12))
+                    p.addView(stepper("Boss si vie ≥", "hpBoss", 10000, 5000, 1000, 1000000, false), topMargin(8))
+                    p.addView(stepper("Amplitude joystick", "radius", 90, 10, 20, 300, false), topMargin(8))
+                    p.addView(toggleRow("Attaque pendant boss", "atkBoss", "OUI", "NON", 0), topMargin(12))
+                    p.addView(toggleRow("Joystick", "fixed", "FIXE", "LIBRE", 1), topMargin(8))
+                    val q = smallButton("[ QUITTER LE BOT ]")
+                    q.setTextColor(0xFFFF4D4D.toInt())
+                    q.background = pill(0xFFFF4D4D.toInt(), 0xCC050A05.toInt())
+                    q.setOnClickListener { stopSelf() }
+                    p.addView(q, topMargin(14))
+                    return p
+                }
+
+                /** Rend une vue déplaçable au doigt : appui court = onTap, appui long immobile = onLong. */
+                private fun drag(v: View, onTap: () -> Unit, onLong: () -> Unit) {
+                    var downX = 0f
+                    var downY = 0f
+                    var startX = 0
+                    var startY = 0
+                    var moved = false
+                    var long = false
+                    val handler = Handler(Looper.getMainLooper())
+                    val longRun = Runnable { long = true; onLong() }
+                    v.setOnTouchListener { _, ev ->
+                        val p = lpOv
+                        if (p != null) {
+                            when (ev.action) {
+                                MotionEvent.ACTION_DOWN -> {
+                                    downX = ev.rawX
+                                    downY = ev.rawY
+                                    startX = p.x
+                                    startY = p.y
+                                    moved = false
+                                    long = false
+                                    handler.postDelayed(longRun, 900)
+                                }
+                                MotionEvent.ACTION_MOVE -> {
+                                    val dx = ev.rawX - downX
+                                    val dy = ev.rawY - downY
+                                    if (!moved && (abs(dx) > 14 || abs(dy) > 14)) {
+                                        moved = true
+                                        handler.removeCallbacks(longRun)
+                                    }
+                                    if (moved) {
+                                        p.x = startX + dx.toInt()
+                                        p.y = startY + dy.toInt()
+                                        try { wm?.updateViewLayout(boxOv, p) } catch (e: Exception) {}
+                                    }
+                                }
+                                MotionEvent.ACTION_UP -> {
+                                    handler.removeCallbacks(longRun)
+                                    if (moved) {
+                                        getSharedPreferences("cfg", MODE_PRIVATE).edit().putInt("ovX", p.x).putInt("ovY", p.y).apply()
+                                    } else if (!long) {
+                                        onTap()
+                                    }
+                                }
+                                MotionEvent.ACTION_CANCEL -> handler.removeCallbacks(longRun)
+                            }
+                        }
+                        true
+                    }
+                }
+
+                private fun showOverlay() {
+                    val cfg = getSharedPreferences("cfg", MODE_PRIVATE)
+                    val box = LinearLayout(this)
+                    box.orientation = LinearLayout.VERTICAL
+
+                    val row = LinearLayout(this)
+                    row.orientation = LinearLayout.HORIZONTAL
+                    val b = smallButton("▶")
+                    val bg = pill(0xFF00B34A.toInt(), 0xCC050A05.toInt())
+                    b.background = bg
+                    mainBg = bg
+                    val menu = smallButton("≡")
+                    row.addView(b)
+                    val lpMenu = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                    lpMenu.leftMargin = 10
+                    row.addView(menu, lpMenu)
+                    box.addView(row)
+
+                    val panel = buildPanel()
+                    panel.visibility = View.GONE
+                    box.addView(panel, topMargin(10))
+
                     val lp = WindowManager.LayoutParams(
                         ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
                         WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
@@ -477,9 +657,15 @@ jobs:
                         PixelFormat.TRANSLUCENT
                     )
                     lp.gravity = Gravity.TOP or Gravity.START
-                    lp.x = 20
-                    lp.y = 20
-                    wm!!.addView(b, lp)
+                    lp.x = cfg.getInt("ovX", 20)
+                    lp.y = cfg.getInt("ovY", 20)
+                    lpOv = lp
+                    drag(b, { toggle() }, { stopSelf() })
+                    drag(menu, {
+                        panel.visibility = if (panel.visibility == View.GONE) View.VISIBLE else View.GONE
+                    }, {})
+                    wm!!.addView(box, lp)
+                    boxOv = box
                     overlay = b
                 }
 
@@ -488,6 +674,7 @@ jobs:
                         running = false
                         gen++
                         overlay?.text = "▶"
+                        mainBg?.setStroke(3, 0xFF00B34A.toInt())
                     } else {
                         gen++
                         val g = gen
@@ -506,7 +693,6 @@ jobs:
                     val cfg = getSharedPreferences("cfg", MODE_PRIVATE)
                     val btnX = (cfg.getFloat("btnFX", 90f) * w / 100f).toInt()
                     val btnY = (cfg.getFloat("btnFY", 70f) * h / 100f).toInt()
-                    val hpBoss = cfg.getInt("hpBoss", 10000).toLong()
                     var lastPet = 0L
                     var noImage = 0
                     while (active(g)) {
@@ -525,6 +711,7 @@ jobs:
                             Thread.sleep(300)
                             continue
                         }
+                        val hpBoss = cfg.getInt("hpBoss", 10000).toLong()
                         val ref = hp.max ?: hp.cur
                         val acc = if (BotAccessibility.instance == null) " | ACCESSIBILITE OFF" else ""
                         val kind = if (ref >= hpBoss) "BOSS" else "PNJ"
@@ -649,7 +836,7 @@ jobs:
                     holding = false
                     gen++
                     try { loopThread?.join(1500) } catch (e: Exception) {}
-                    try { overlay?.let { wm?.removeView(it) } } catch (e: Exception) {}
+                    try { boxOv?.let { wm?.removeView(it) } } catch (e: Exception) {}
                     try { vd?.release() } catch (e: Exception) {}
                     try { reader?.close() } catch (e: Exception) {}
                     try { projection?.stop() } catch (e: Exception) {}
@@ -789,12 +976,17 @@ jobs:
 
             import android.app.Activity
             import android.content.Intent
+            import android.content.res.ColorStateList
             import android.graphics.Typeface
             import android.graphics.drawable.GradientDrawable
+            import android.graphics.drawable.StateListDrawable
             import android.media.projection.MediaProjectionManager
             import android.net.Uri
             import android.os.Bundle
             import android.provider.Settings
+            import android.text.SpannableStringBuilder
+            import android.text.Spanned
+            import android.text.style.ForegroundColorSpan
             import android.util.DisplayMetrics
             import android.view.Gravity
             import android.view.ViewGroup
@@ -809,9 +1001,13 @@ jobs:
             class MainActivity : Activity() {
                 private val GREEN = 0xFF00FF41.toInt()
                 private val DIM = 0xFF00B34A.toInt()
+                private val CYAN = 0xFF19D3FF.toInt()
+                private val AMBER = 0xFFFFB000.toInt()
+                private val RED = 0xFFFF4D4D.toInt()
                 private val SOFT = 0xFF9FE8B4.toInt()
                 private val BG = 0xFF050A05.toInt()
                 private val PANEL = 0xFF0D1A0D.toInt()
+                private val CARD = 0xFF081008.toInt()
 
                 private val fields = LinkedHashMap<String, EditText>()
                 private val defaults = linkedMapOf(
@@ -837,13 +1033,22 @@ jobs:
 
                 private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
-                private fun styled(b: Button) {
+                private fun outline(stroke: Int, fill: Int, radius: Int): GradientDrawable {
                     val d = GradientDrawable()
-                    d.setColor(PANEL)
-                    d.setStroke(dp(1) + 1, GREEN)
-                    d.cornerRadius = dp(6).toFloat()
-                    b.background = d
-                    b.setTextColor(GREEN)
+                    d.setColor(fill)
+                    d.setStroke(dp(1) + 1, stroke)
+                    d.cornerRadius = dp(radius).toFloat()
+                    return d
+                }
+
+                private fun styled(b: Button, color: Int) {
+                    val sl = StateListDrawable()
+                    sl.addState(intArrayOf(android.R.attr.state_pressed), outline(color, color, 6))
+                    sl.addState(intArrayOf(), outline(color, PANEL, 6))
+                    b.background = sl
+                    b.setTextColor(
+                        ColorStateList(arrayOf(intArrayOf(android.R.attr.state_pressed), intArrayOf()), intArrayOf(BG, color))
+                    )
                     b.typeface = Typeface.MONOSPACE
                     b.setAllCaps(false)
                     b.textSize = 14f
@@ -858,6 +1063,7 @@ jobs:
                     val prefs = getSharedPreferences("cfg", MODE_PRIVATE)
                     val sv = ScrollView(this)
                     sv.setBackgroundColor(BG)
+                    sv.isVerticalScrollBarEnabled = false
                     val box = LinearLayout(this)
                     box.orientation = LinearLayout.VERTICAL
                     box.setPadding(dp(18), dp(18), dp(18), dp(30))
@@ -869,76 +1075,90 @@ jobs:
                         return l
                     }
 
-                    fun text(t: String, color: Int, size: Float, top: Int): TextView {
+                    fun text(parent: LinearLayout, t: String, color: Int, size: Float, top: Int): TextView {
                         val tv = TextView(this)
                         tv.text = t
                         tv.setTextColor(color)
                         tv.typeface = Typeface.MONOSPACE
                         tv.textSize = size
-                        box.addView(tv, lp(top))
+                        parent.addView(tv, lp(top))
                         return tv
                     }
 
-                    fun header(t: String) { text("// " + t, DIM, 13f, 24) }
-
-                    fun button(t: String, action: () -> Unit) {
-                        val b = Button(this)
-                        b.text = t
-                        styled(b)
-                        b.setOnClickListener { action() }
-                        box.addView(b, lp(8))
+                    fun section(num: String, title: String): LinearLayout {
+                        text(box, "── " + num + " · " + title + " ──", CYAN, 13f, 24)
+                        val card = LinearLayout(this)
+                        card.orientation = LinearLayout.VERTICAL
+                        card.background = outline(DIM, CARD, 8)
+                        card.setPadding(dp(12), dp(6), dp(12), dp(14))
+                        box.addView(card, lp(8))
+                        return card
                     }
 
-                    text("> " + getString(R.string.app_name).uppercase() + "_", GREEN, 24f, 0)
-                    val st = text("", GREEN, 13f, 12)
-                    st.setBackgroundColor(PANEL)
+                    fun button(parent: LinearLayout, t: String, color: Int, action: () -> Unit) {
+                        val b = Button(this)
+                        b.text = "▸ " + t
+                        styled(b, color)
+                        b.setOnClickListener { action() }
+                        parent.addView(b, lp(8))
+                    }
+
+                    text(box, "root@tablette:~$ ./wildcraft_bot --ready", DIM, 12f, 0)
+                    text(box, "> " + getString(R.string.app_name).uppercase() + "_", GREEN, 26f, 4)
+                    val st = text(box, "", GREEN, 13f, 12)
+                    st.background = outline(DIM, PANEL, 8)
                     st.setPadding(dp(12), dp(10), dp(12), dp(10))
                     status = st
 
-                    header("01  AUTORISATIONS")
-                    button("1a. Autoriser l'affichage par-dessus les applis") {
+                    val s1 = section("01", "AUTORISATIONS")
+                    button(s1, "1a. Autoriser l'affichage par-dessus les applis", GREEN) {
                         startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + packageName)))
                     }
-                    button("1b. Activer le service d'accessibilité") {
+                    button(s1, "1b. Activer le service d'accessibilité", GREEN) {
                         startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
                     }
 
-                    header("02  CIBLES PAR IMAGES  (inutile si Méthode = 1)")
+                    val s2 = section("02", "CIBLES PAR IMAGES (inutile si Méthode = 1)")
                     text(
-                        "PNJ : choisissez des images rognées du PNJ (son nom ou une icône).\n" +
-                            "BOSS : on ne cherche pas le boss lui-même, mais SA BARRE DE VIE. Rognez dans une capture un petit " +
-                            "rectangle de la partie COLORÉE de la barre (sans bord ni fond), puis choisissez-le ici.\n" +
-                            "Si la barre change de couleur avec la vie, ajoutez une image par couleur.",
+                        s2,
+                        "PNJ : images rognées du PNJ (son nom ou une icône).\n" +
+                            "BOSS : une image de la partie COLORÉE de sa barre de vie, sans bord ni fond. " +
+                            "Une image par couleur si la barre change de couleur.",
                         SOFT, 12f, 6
                     )
-                    button("2a. PNJ  : ajouter des images") { pick(PICK_NPC) }
-                    button("2b. BOSS : ajouter des images de barre de vie") { pick(PICK_BOSS) }
-                    button("Effacer les images de PNJ") { clear("npc_") }
-                    button("Effacer les images de boss") { clear("boss_") }
+                    button(s2, "2a. PNJ : ajouter des images", GREEN) { pick(PICK_NPC) }
+                    button(s2, "2b. BOSS : ajouter des images de barre de vie", GREEN) { pick(PICK_BOSS) }
+                    button(s2, "Effacer les images de PNJ", AMBER) { clear("npc_") }
+                    button(s2, "Effacer les images de boss", AMBER) { clear("boss_") }
 
-                    header("03  POSITIONS")
-                    button("3a. Placer le joystick et le bouton d'attaque") { calibrate("buttons") }
-                    button("3b. Placer la zone du nombre de vie (ciblez un monstre avant)") { calibrate("zone") }
-                    button("Test des gestes (dans 8 s : appui attaque, puis joystick tenu 3 s)") { testGestures() }
+                    val s3 = section("03", "POSITIONS")
+                    button(s3, "3a. Placer le joystick et le bouton d'attaque", CYAN) { calibrate("buttons") }
+                    button(s3, "3b. Placer la zone du nombre de vie (ciblez un monstre avant)", CYAN) { calibrate("zone") }
+                    button(s3, "Test des gestes (dans 8 s : appui attaque, puis joystick tenu 3 s)", AMBER) { testGestures() }
 
-                    header("04  REGLAGES")
+                    val s4 = section("04", "REGLAGES")
                     for ((k, d) in defaults) {
-                        text(labels[k] ?: k, DIM, 12f, 12)
+                        text(s4, labels[k] ?: k, SOFT, 12f, 12)
                         val et = EditText(this)
                         et.setText(prefs.getInt(k, d).toString())
                         et.inputType = android.text.InputType.TYPE_CLASS_NUMBER
                         et.setTextColor(GREEN)
                         et.typeface = Typeface.MONOSPACE
-                        et.setBackgroundColor(PANEL)
+                        et.background = outline(DIM, PANEL, 4)
                         et.setPadding(dp(12), dp(8), dp(12), dp(8))
-                        box.addView(et, lp(4))
+                        s4.addView(et, lp(4))
                         fields[k] = et
                     }
 
-                    header("05  LANCEMENT")
-                    button("4. DEMARRER  (puis ouvrez WildCraft)") { start() }
-                    button("[ QUITTER LE BOT ]") { quitBot() }
-                    text("Astuce : un appui long sur le bouton flottant quitte aussi le bot.", SOFT, 12f, 10)
+                    val s5 = section("05", "LANCEMENT")
+                    button(s5, "4. DEMARRER  (puis ouvrez WildCraft)", GREEN) { start() }
+                    button(s5, "[ QUITTER LE BOT ]", RED) { quitBot() }
+                    text(
+                        s5,
+                        "En jeu : le bouton flottant se déplace au doigt, ≡ ouvre les réglages rapides, " +
+                            "et un appui long dessus quitte le bot.",
+                        SOFT, 12f, 10
+                    )
                     setContentView(sv)
                 }
 
@@ -950,13 +1170,24 @@ jobs:
                 private fun count(prefix: String): Int =
                     (filesDir.listFiles() ?: emptyArray()).count { it.name.startsWith(prefix) }
 
+                private fun statusLine(sb: SpannableStringBuilder, ok: Boolean, label: String, value: String) {
+                    val start = sb.length
+                    sb.append("● ")
+                    sb.setSpan(ForegroundColorSpan(if (ok) GREEN else AMBER), start, start + 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                    sb.append(label).append(" : ").append(value).append("\n")
+                }
+
                 private fun refreshStatus() {
                     val cfg = getSharedPreferences("cfg", MODE_PRIVATE)
-                    val ok = cfg.contains("joyFX") && cfg.contains("btnFX")
-                    status?.text = "[positions]  " + (if (ok) "OK" else "a placer") +
-                        "\n[zone de vie]  " + (if (cfg.contains("hp1FX") && cfg.contains("hp2FX")) "OK" else "a placer") +
-                        "\n[images PNJ]  " + count("npc_") + "\n[images BOSS] " + count("boss_") +
-                        "\n[accessibilite] " + (if (BotAccessibility.instance != null) "ON" else "OFF")
+                    val pos = cfg.contains("joyFX") && cfg.contains("btnFX")
+                    val zone = cfg.contains("hp1FX") && cfg.contains("hp2FX")
+                    val acc = BotAccessibility.instance != null
+                    val sb = SpannableStringBuilder()
+                    statusLine(sb, pos, "positions", if (pos) "OK" else "à placer (3a)")
+                    statusLine(sb, zone, "zone de vie", if (zone) "OK" else "à placer (3b)")
+                    statusLine(sb, acc, "accessibilité", if (acc) "ON" else "OFF (1b)")
+                    statusLine(sb, true, "images PNJ / BOSS", count("npc_").toString() + " / " + count("boss_").toString())
+                    status?.text = sb
                 }
 
                 private fun clear(prefix: String) {
