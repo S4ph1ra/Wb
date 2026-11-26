@@ -114,36 +114,57 @@ jobs:
                 override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
                 override fun onInterrupt() {}
 
+                private fun pointPath(x: Int, y: Int): Path = Path().apply { moveTo(x.toFloat(), y.toFloat()) }
+
                 fun tap(x: Int, y: Int) {
-                    val p = Path().apply { moveTo(x.toFloat(), y.toFloat()) }
                     val g = GestureDescription.Builder()
-                        .addStroke(GestureDescription.StrokeDescription(p, 0, 60))
+                        .addStroke(GestureDescription.StrokeDescription(pointPath(x, y), 0, 60))
                         .build()
                     dispatchGesture(g, null, null)
                 }
 
-                /** Mode joystick LIBRE : glisse de (jx,jy) vers (tx,ty), avec ou sans appui sur le bouton d'attaque. */
-                fun moveAndAttack(jx: Int, jy: Int, tx: Int, ty: Int, ax: Int, ay: Int, durMs: Long, attack: Boolean) {
-                    val joy = Path().apply { moveTo(jx.toFloat(), jy.toFloat()); lineTo(tx.toFloat(), ty.toFloat()) }
-                    val b = GestureDescription.Builder()
-                        .addStroke(GestureDescription.StrokeDescription(joy, 0, durMs))
-                    if (attack) {
-                        val atk = Path().apply { moveTo(ax.toFloat(), ay.toFloat()) }
-                        b.addStroke(GestureDescription.StrokeDescription(atk, 0, 60))
+                /** Appui maintenu pendant durMs millisecondes. */
+                fun hold(x: Int, y: Int, durMs: Long) {
+                    val g = GestureDescription.Builder()
+                        .addStroke(GestureDescription.StrokeDescription(pointPath(x, y), 0, maxOf(60L, durMs)))
+                        .build()
+                    dispatchGesture(g, null, null)
+                }
+
+                private fun addExtras(b: GestureDescription.Builder, extras: List<IntArray>) {
+                    for (e in extras.take(6)) {
+                        b.addStroke(GestureDescription.StrokeDescription(pointPath(e[0], e[1]), 0, maxOf(60L, e[2].toLong())))
                     }
+                }
+
+                /** Mode joystick LIBRE : glisse de (jx,jy) vers (tx,ty), avec ou sans appui sur le bouton d'attaque. */
+                fun moveAndAttack(
+                    jx: Int, jy: Int, tx: Int, ty: Int, ax: Int, ay: Int,
+                    durMs: Long, attack: Boolean, extras: List<IntArray>
+                ) {
+                    val joy = Path().apply { moveTo(jx.toFloat(), jy.toFloat()); lineTo(tx.toFloat(), ty.toFloat()) }
+                    val dur = maxOf(durMs, (extras.maxOfOrNull { it[2] } ?: 0).toLong())
+                    val b = GestureDescription.Builder()
+                        .addStroke(GestureDescription.StrokeDescription(joy, 0, dur))
+                    if (attack) b.addStroke(GestureDescription.StrokeDescription(pointPath(ax, ay), 0, 60))
+                    addExtras(b, extras)
                     dispatchGesture(b.build(), null, null)
                 }
 
                 /**
                  * Mode joystick FIXE : pousse le joystick dans une direction et la maintient tant que keep()
-                 * renvoie true. Si attack est vrai, un simple appui sur le bouton d'attaque est ajouté à chaque
-                 * tranche (environ une fois par seconde), pendant que le joystick reste tenu. Bloquant.
+                 * renvoie true. Chaque tranche peut contenir un appui d'attaque et les commandes dues (extras).
+                 * Un autre geste envoyé pendant ce temps coupe immédiatement le maintien. Bloquant.
                  */
-                fun holdDirection(jx: Int, jy: Int, tx: Int, ty: Int, ax: Int, ay: Int, attack: Boolean, keep: () -> Boolean) {
+                fun holdDirection(
+                    jx: Int, jy: Int, tx: Int, ty: Int, ax: Int, ay: Int, attack: Boolean,
+                    extras: () -> List<IntArray>, keep: () -> Boolean
+                ) {
                     val joyMove = Path().apply { moveTo(jx.toFloat(), jy.toFloat()); lineTo(tx.toFloat(), ty.toFloat()) }
                     val joyHold = Path().apply { moveTo(tx.toFloat(), ty.toFloat()) }
-                    val atkTap = Path().apply { moveTo(ax.toFloat(), ay.toFloat()) }
-                    var j = GestureDescription.StrokeDescription(joyMove, 0, 300, true)
+                    var ex = extras()
+                    var dur = maxOf(300, ex.maxOfOrNull { it[2] } ?: 0).toLong()
+                    var j = GestureDescription.StrokeDescription(joyMove, 0, dur, true)
                     var cancelled = false
                     while (true) {
                         val latch = CountDownLatch(1)
@@ -152,7 +173,8 @@ jobs:
                             override fun onCancelled(g: GestureDescription?) { cancelled = true; latch.countDown() }
                         }
                         val b = GestureDescription.Builder().addStroke(j)
-                        if (attack) b.addStroke(GestureDescription.StrokeDescription(atkTap, 0, 60))
+                        if (attack) b.addStroke(GestureDescription.StrokeDescription(pointPath(ax, ay), 0, 60))
+                        addExtras(b, ex)
                         val ok = dispatchGesture(b.build(), cb, null)
                         if (!ok) return
                         latch.await()
@@ -162,7 +184,9 @@ jobs:
                             dispatchGesture(GestureDescription.Builder().addStroke(j).build(), null, null)
                             return
                         }
-                        j = j.continueStroke(joyHold, 0, 900, true)
+                        ex = extras()
+                        dur = maxOf(900, ex.maxOfOrNull { it[2] } ?: 0).toLong()
+                        j = j.continueStroke(joyHold, 0, dur, true)
                     }
                 }
             }
@@ -205,6 +229,7 @@ jobs:
             import com.google.mlkit.vision.text.TextRecognition
             import com.google.mlkit.vision.text.TextRecognizer
             import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+            import org.json.JSONArray
             import org.opencv.android.OpenCVLoader
             import org.opencv.android.Utils
             import org.opencv.core.Core
@@ -231,6 +256,13 @@ jobs:
                 private var loopThread: Thread? = null
                 private var w = 0
                 private var h = 0
+                companion object {
+                    const val ALIVE = 1
+                    const val MISSING = 0
+                    const val DEAD = -1
+                    const val UNKNOWN = 2
+                }
+
                 private var tplsNpc: List<Mat> = emptyList()
                 private var bossRefs: List<BossRef> = emptyList()
 
@@ -251,6 +283,7 @@ jobs:
 
                 override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
                     if (intent?.action == "STOP") { stopSelf(); return START_NOT_STICKY }
+                    L.init(this)
                     startNotif()
                     if (overlay != null) return START_NOT_STICKY
                     val code = intent?.getIntExtra("code", 0) ?: 0
@@ -431,7 +464,7 @@ jobs:
                 /** Lit le nombre de vie dans la zone réglée (reconnaissance de texte sur l'appareil, sans internet). */
                 private fun readHp(f: Frame): Hp? {
                     try {
-                        val cfg = getSharedPreferences("cfg", MODE_PRIVATE)
+                        val cfg = Store.cfg(this)
                         if (!cfg.contains("hp1FX") || !cfg.contains("hp2FX")) return null
                         val x1 = (cfg.getFloat("hp1FX", 0f) * w / 100f).toInt().coerceIn(0, w - 2)
                         val y1 = (cfg.getFloat("hp1FY", 0f) * h / 100f).toInt().coerceIn(0, h - 2)
@@ -506,7 +539,7 @@ jobs:
                 }
 
                 private fun stepper(name: String, key: String, def: Int, step: Int, min: Int, max: Int, wrap: Boolean): LinearLayout {
-                    val cfg = getSharedPreferences("cfg", MODE_PRIVATE)
+                    val cfg = Store.cfg(this)
                     val row = LinearLayout(this)
                     row.orientation = LinearLayout.HORIZONTAL
                     row.gravity = Gravity.CENTER_VERTICAL
@@ -543,7 +576,7 @@ jobs:
                 }
 
                 private fun toggleRow(name: String, key: String, onT: String, offT: String, def: Int): Button {
-                    val cfg = getSharedPreferences("cfg", MODE_PRIVATE)
+                    val cfg = Store.cfg(this)
                     val b = smallButton("")
                     fun refresh() { b.text = name + " : " + (if (cfg.getInt(key, def) == 1) onT else offT) }
                     refresh()
@@ -563,13 +596,13 @@ jobs:
                     bg.setStroke(3, 0xFF00FF41.toInt())
                     bg.cornerRadius = 16f
                     p.background = bg
-                    p.addView(panelLabel("// REGLAGES EN JEU (effet au prochain boss)"))
-                    p.addView(stepper("Direction (°)", "dir", 0, 15, 0, 345, true), topMargin(12))
-                    p.addView(stepper("Boss si vie ≥", "hpBoss", 10000, 5000, 1000, 1000000, false), topMargin(8))
-                    p.addView(stepper("Amplitude joystick", "radius", 90, 10, 20, 300, false), topMargin(8))
-                    p.addView(toggleRow("Attaque pendant boss", "atkBoss", "OUI", "NON", 0), topMargin(12))
-                    p.addView(toggleRow("Joystick", "fixed", "FIXE", "LIBRE", 1), topMargin(8))
-                    val q = smallButton("[ QUITTER LE BOT ]")
+                    p.addView(panelLabel(L.t("o_title")))
+                    p.addView(stepper(L.t("o_dir"), "dir", 0, 15, 0, 345, true), topMargin(12))
+                    p.addView(stepper(L.t("o_hp"), "hpBoss", 10000, 5000, 1000, 1000000, false), topMargin(8))
+                    p.addView(stepper(L.t("o_radius"), "radius", 90, 10, 20, 300, false), topMargin(8))
+                    p.addView(toggleRow(L.t("o_atk"), "atkBoss", L.t("o_yes"), L.t("o_no"), 0), topMargin(12))
+                    p.addView(toggleRow(L.t("o_joy"), "fixed", L.t("o_fixed"), L.t("o_free"), 1), topMargin(8))
+                    val q = smallButton(L.t("o_quit"))
                     q.setTextColor(0xFFFF4D4D.toInt())
                     q.background = pill(0xFFFF4D4D.toInt(), 0xCC050A05.toInt())
                     q.setOnClickListener { stopSelf() }
@@ -616,7 +649,7 @@ jobs:
                                 MotionEvent.ACTION_UP -> {
                                     handler.removeCallbacks(longRun)
                                     if (moved) {
-                                        getSharedPreferences("cfg", MODE_PRIVATE).edit().putInt("ovX", p.x).putInt("ovY", p.y).apply()
+                                        Store.cfg(this).edit().putInt("ovX", p.x).putInt("ovY", p.y).apply()
                                     } else if (!long) {
                                         onTap()
                                     }
@@ -629,7 +662,7 @@ jobs:
                 }
 
                 private fun showOverlay() {
-                    val cfg = getSharedPreferences("cfg", MODE_PRIVATE)
+                    val cfg = Store.cfg(this)
                     val box = LinearLayout(this)
                     box.orientation = LinearLayout.VERTICAL
 
@@ -680,7 +713,7 @@ jobs:
                         val g = gen
                         running = true
                         overlay?.text = "■"
-                        val t = Thread { try { if (getSharedPreferences("cfg", MODE_PRIVATE).getInt("ocr", 1) == 1) loopOcr(g) else loopImages(g) } catch (e: Exception) {} }
+                        val t = Thread { try { if (Store.cfg(this).getInt("ocr", 1) == 1) loopOcr(g) else loopImages(g) } catch (e: Exception) {} }
                         loopThread = t
                         t.start()
                     }
@@ -688,9 +721,60 @@ jobs:
 
                 private fun active(g: Int): Boolean = running && gen == g
 
+                private class Cmd(val id: String, val x: Float, val y: Float, val hold: Int, val trig: Int, val every: Int)
+
+                private val lastRun = HashMap<String, Long>()
+
+                private fun loadCmds(): List<Cmd> {
+                    val out = ArrayList<Cmd>()
+                    try {
+                        val arr = JSONArray(Store.cfg(this).getString("cmds", "[]"))
+                        for (i in 0 until arr.length()) {
+                            val o = arr.getJSONObject(i)
+                            if (o.optInt("e", 1) != 1) continue
+                            val x = o.optDouble("x", -1.0)
+                            val y = o.optDouble("y", -1.0)
+                            if (x < 0 || y < 0) continue
+                            val hold = if (o.optInt("a", 0) == 1) o.optInt("ms", 600) else 0
+                            out.add(Cmd(i.toString() + o.optString("n", ""), x.toFloat(), y.toFloat(), hold, o.optInt("t", 0), maxOf(1, o.optInt("s", 30))))
+                        }
+                    } catch (e: Exception) {}
+                    return out
+                }
+
+                /** Commandes à lancer maintenant. ctx : 0 rien en vue, 1 face à un PNJ, 2 face à un boss. Renvoie [x, y, durée]. */
+                private fun due(ctx: Int): List<IntArray> {
+                    val now = System.currentTimeMillis()
+                    val res = ArrayList<IntArray>()
+                    for (c in loadCmds()) {
+                        if (!(c.trig == 0 || c.trig == ctx)) continue
+                        val last = lastRun[c.id] ?: now
+                        if (lastRun[c.id] == null) lastRun[c.id] = now
+                        if (now - last >= c.every * 1000L) {
+                            lastRun[c.id] = now
+                            res.add(intArrayOf((c.x * w / 100f).toInt(), (c.y * h / 100f).toInt(), c.hold))
+                        }
+                    }
+                    return res
+                }
+
+                /** Lance tout de suite les commandes dues (hors combat de boss). */
+                private fun runDue(ctx: Int) {
+                    val acc = BotAccessibility.instance ?: return
+                    for (e in due(ctx)) {
+                        if (e[2] > 0) {
+                            acc.hold(e[0], e[1], e[2].toLong())
+                            Thread.sleep(e[2].toLong() + 80)
+                        } else {
+                            acc.tap(e[0], e[1])
+                            Thread.sleep(150)
+                        }
+                    }
+                }
+
                 /** Méthode 1 : lecture du nombre de vie. Au-dessus du seuil = boss, en dessous = PNJ. */
                 private fun loopOcr(g: Int) {
-                    val cfg = getSharedPreferences("cfg", MODE_PRIVATE)
+                    val cfg = Store.cfg(this)
                     val btnX = (cfg.getFloat("btnFX", 90f) * w / 100f).toInt()
                     val btnY = (cfg.getFloat("btnFY", 70f) * h / 100f).toInt()
                     var lastPet = 0L
@@ -699,7 +783,7 @@ jobs:
                         val f = grab()
                         if (f == null) {
                             noImage++
-                            if (noImage == 10) setLabel("■ pas d'image reçue")
+                            if (noImage == 10) setLabel("■ " + L.t("o_noimg"))
                             Thread.sleep(200)
                             continue
                         }
@@ -707,32 +791,38 @@ jobs:
                         val hp = readHp(f)
                         f.release()
                         if (hp == null) {
-                            setLabel("■ aucun nombre lu (" + lastRaw.take(14) + ")")
+                            setLabel("■ " + L.t("o_nonum") + " (" + lastRaw.take(14) + ")")
+                            runDue(0)
                             Thread.sleep(300)
                             continue
                         }
                         val hpBoss = cfg.getInt("hpBoss", 10000).toLong()
                         val ref = hp.max ?: hp.cur
-                        val acc = if (BotAccessibility.instance == null) " | ACCESSIBILITE OFF" else ""
+                        val acc = if (BotAccessibility.instance == null) " | " + L.t("o_accoff") else ""
                         val kind = if (ref >= hpBoss) "BOSS" else "PNJ"
-                        setLabel("■ vie " + hp.cur + (if (hp.max != null) "/" + hp.max else "") + " → " + kind + acc)
+                        setLabel("■ " + L.t("o_life") + " " + hp.cur + (if (hp.max != null) "/" + hp.max else "") + " → " + kind + acc)
                         if (hp.cur > 0) {
                             if (ref >= hpBoss) {
                                 circleBoss(g) {
                                     val f2 = grab()
                                     if (f2 == null) {
-                                        null
+                                        UNKNOWN
                                     } else {
                                         val h2 = readHp(f2)
                                         f2.release()
-                                        setLabel("■ BOSS vie " + (if (h2 != null) h2.cur.toString() else "?"))
-                                        h2 != null && h2.cur > 0
+                                        setLabel("■ BOSS " + L.t("o_life") + " " + (if (h2 != null) h2.cur.toString() else "?"))
+                                        if (h2 == null) MISSING else if (h2.cur <= 0) DEAD else ALIVE
                                     }
                                 }
-                            } else if (System.currentTimeMillis() - lastPet > 2000) {
-                                BotAccessibility.instance?.tap(btnX, btnY)
-                                lastPet = System.currentTimeMillis()
+                            } else {
+                                if (System.currentTimeMillis() - lastPet > 2000) {
+                                    BotAccessibility.instance?.tap(btnX, btnY)
+                                    lastPet = System.currentTimeMillis()
+                                }
+                                runDue(1)
                             }
+                        } else {
+                            runDue(0)
                         }
                         Thread.sleep(300)
                     }
@@ -740,7 +830,7 @@ jobs:
 
                 /** Méthode 0 : reconnaissance par images (PNJ) et par couleur de barre (boss). */
                 private fun loopImages(g: Int) {
-                    val cfg = getSharedPreferences("cfg", MODE_PRIVATE)
+                    val cfg = Store.cfg(this)
                     val btnX = (cfg.getFloat("btnFX", 90f) * w / 100f).toInt()
                     val btnY = (cfg.getFloat("btnFY", 70f) * h / 100f).toInt()
                     val thrNpc = cfg.getInt("thrNpc", 75) / 100.0
@@ -752,7 +842,7 @@ jobs:
                         val f = grab()
                         if (f == null) {
                             noImage++
-                            if (noImage == 10) setLabel("■ pas d'image reçue")
+                            if (noImage == 10) setLabel("■ " + L.t("o_noimg"))
                             Thread.sleep(200)
                             continue
                         }
@@ -762,31 +852,36 @@ jobs:
                         f.release()
                         val boss = sBoss >= thrBoss
                         val npc = !boss && sNpc >= thrNpc
-                        val acc = if (BotAccessibility.instance == null) " | ACCESSIBILITE OFF" else ""
+                        val acc = if (BotAccessibility.instance == null) " | " + L.t("o_accoff") else ""
                         setLabel("■ PNJ " + fmt(sNpc) + "/" + fmt(thrNpc) + " | Boss " + fmt(sBoss) + "/" + fmt(thrBoss) + acc)
                         if (boss) {
                             circleBoss(g) {
                                 val f2 = grab()
                                 if (f2 == null) {
-                                    null
+                                    UNKNOWN
                                 } else {
                                     val sb = bossScore(f2.rgba, tol)
                                     f2.release()
-                                    setLabel("■ BOSS en cours " + fmt(sb) + "/" + fmt(thrBoss))
-                                    sb >= thrBoss
+                                    setLabel("■ BOSS " + fmt(sb) + "/" + fmt(thrBoss))
+                                    if (sb >= thrBoss) ALIVE else MISSING
                                 }
                             }
-                        } else if (npc && System.currentTimeMillis() - lastPet > 2000) {
-                            BotAccessibility.instance?.tap(btnX, btnY)
-                            lastPet = System.currentTimeMillis()
+                        } else if (npc) {
+                            if (System.currentTimeMillis() - lastPet > 2000) {
+                                BotAccessibility.instance?.tap(btnX, btnY)
+                                lastPet = System.currentTimeMillis()
+                            }
+                            runDue(1)
+                        } else {
+                            runDue(0)
                         }
                         Thread.sleep(300)
                     }
                 }
 
-                /** Tourne autour du boss tant que alive() renvoie true (null = pas d'information, on ne change rien). */
-                private fun circleBoss(g: Int, alive: () -> Boolean?) {
-                    val cfg = getSharedPreferences("cfg", MODE_PRIVATE)
+                /** Tourne autour du boss tant que alive() ne dit pas que le boss est fini. */
+                private fun circleBoss(g: Int, alive: () -> Int) {
+                    val cfg = Store.cfg(this)
                     val jx = (cfg.getFloat("joyFX", 15f) * w / 100f).toInt()
                     val jy = (cfg.getFloat("joyFY", 70f) * h / 100f).toInt()
                     val ax = (cfg.getFloat("btnFX", 90f) * w / 100f).toInt()
@@ -796,6 +891,7 @@ jobs:
                     val maxMiss = cfg.getInt("bossMiss", 4)
                     val attack = cfg.getInt("atkBoss", 0) == 1
                     var missing = 0
+                    var dead = 0
 
                     if (fixed) {
                         val rad = Math.toRadians(cfg.getInt("dir", 0).toDouble())
@@ -804,16 +900,20 @@ jobs:
                         holding = true
                         val t = Thread {
                             try {
-                                BotAccessibility.instance?.holdDirection(jx, jy, tx, ty, ax, ay, attack) { holding && active(g) }
+                                BotAccessibility.instance?.holdDirection(jx, jy, tx, ty, ax, ay, attack, { due(2) }) { holding && active(g) }
                             } catch (e: Exception) {}
                         }
                         t.start()
                         while (active(g) && missing < maxMiss) {
                             Thread.sleep(300)
                             val a = alive()
-                            if (a == true) missing = 0 else if (a == false) missing++
+                            if (a == ALIVE) { missing = 0; dead = 0 }
+                            else if (a == MISSING) missing++
+                            else if (a == DEAD) { dead++; if (dead >= 2) missing = maxMiss }
                         }
                         holding = false
+                        // un nouveau geste coupe aussitôt le maintien : le joystick est relâché tout de suite
+                        BotAccessibility.instance?.tap(jx, jy)
                         t.join(3000)
                         return
                     }
@@ -824,10 +924,12 @@ jobs:
                         val rad = Math.toRadians(angle)
                         val tx = jx + (r * cos(rad)).toInt()
                         val ty = jy + (r * sin(rad)).toInt()
-                        BotAccessibility.instance?.moveAndAttack(jx, jy, tx, ty, ax, ay, 300, attack)
+                        BotAccessibility.instance?.moveAndAttack(jx, jy, tx, ty, ax, ay, 300, attack, due(2))
                         Thread.sleep(340)
                         val a = alive()
-                        if (a == true) missing = 0 else if (a == false) missing++
+                        if (a == ALIVE) { missing = 0; dead = 0 }
+                        else if (a == MISSING) missing++
+                        else if (a == DEAD) { dead++; if (dead >= 2) missing = maxMiss }
                     }
                 }
 
@@ -866,6 +968,7 @@ jobs:
             import android.widget.FrameLayout
             import android.widget.TextView
             import android.widget.Toast
+            import org.json.JSONArray
 
             /** Voile par-dessus le jeu : on touche les endroits demandés, ils sont enregistrés (en % de l'écran). */
             class CalibService : Service() {
@@ -875,26 +978,48 @@ jobs:
                 private var steps: List<String> = emptyList()
                 private var keys: List<String> = emptyList()
                 private var done = ""
+                private var mode = "buttons"
+                private var cmdIndex = -1
                 private var step = 0
 
                 override fun onBind(intent: Intent?): IBinder? = null
 
                 override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-                    if (intent?.getStringExtra("mode") == "zone") {
-                        steps = listOf(
-                            "Touchez le coin HAUT-GAUCHE de la zone du nombre de vie",
-                            "Touchez le coin BAS-DROIT de cette zone (autour du nombre seulement)"
-                        )
+                    L.init(this)
+                    mode = intent?.getStringExtra("mode") ?: "buttons"
+                    cmdIndex = intent?.getIntExtra("index", -1) ?: -1
+                    if (mode == "zone") {
+                        steps = listOf(L.t("c_z1"), L.t("c_z2"))
                         keys = listOf("hp1", "hp2")
-                        done = "Zone du nombre de vie enregistrée ✔"
+                        done = L.t("c_done_zone")
+                    } else if (mode == "cmd") {
+                        val name = intent?.getStringExtra("name") ?: ""
+                        steps = listOf(L.t("cmd_pos_step") + " « " + name + " »")
+                        keys = listOf("cmd")
+                        done = L.t("cmd_pos_ok")
                     } else {
-                        steps = listOf("Touchez le CENTRE du joystick de déplacement", "Touchez le bouton d'ATTAQUE")
+                        steps = listOf(L.t("c_joy"), L.t("c_btn"))
                         keys = listOf("joy", "btn")
-                        done = "Positions enregistrées ✔"
+                        done = L.t("c_done_btn")
                     }
                     step = 0
                     handler.postDelayed({ show() }, 12000)
                     return START_NOT_STICKY
+                }
+
+                private fun saveTouch(xPct: Float, yPct: Float) {
+                    val cfg = Store.cfg(this)
+                    if (mode == "cmd") {
+                        try {
+                            val arr = JSONArray(cfg.getString("cmds", "[]"))
+                            val o = arr.getJSONObject(cmdIndex)
+                            o.put("x", xPct.toDouble())
+                            o.put("y", yPct.toDouble())
+                            cfg.edit().putString("cmds", arr.toString()).apply()
+                        } catch (e: Exception) {}
+                    } else {
+                        cfg.edit().putFloat(keys[step] + "FX", xPct).putFloat(keys[step] + "FY", yPct).apply()
+                    }
                 }
 
                 @Suppress("DEPRECATION")
@@ -915,13 +1040,13 @@ jobs:
                     label.setTextColor(0xFF00FF41.toInt())
                     label.typeface = Typeface.MONOSPACE
                     label.gravity = Gravity.CENTER
-                    val lpLabel = FrameLayout.LayoutParams(
-                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER
+                    frame.addView(
+                        label,
+                        FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER)
                     )
-                    frame.addView(label, lpLabel)
 
                     val cancel = Button(this)
-                    cancel.text = "Annuler"
+                    cancel.text = L.t("c_cancel")
                     cancel.setOnClickListener { stopSelf() }
                     frame.addView(
                         cancel,
@@ -933,10 +1058,7 @@ jobs:
 
                     frame.setOnTouchListener { _, ev ->
                         if (ev.action == MotionEvent.ACTION_DOWN) {
-                            val e = getSharedPreferences("cfg", MODE_PRIVATE).edit()
-                            e.putFloat(keys[step] + "FX", ev.rawX / sw * 100f)
-                            e.putFloat(keys[step] + "FY", ev.rawY / sh * 100f)
-                            e.apply()
+                            saveTouch(ev.rawX / sw * 100f, ev.rawY / sh * 100f)
                             step++
                             if (step >= steps.size) {
                                 Toast.makeText(this, done, Toast.LENGTH_LONG).show()
@@ -971,10 +1093,169 @@ jobs:
             }
             WCEOF
             mkdir -p app/src/main/java/com/example/wcbot
+            cat > app/src/main/java/com/example/wcbot/Lang.kt <<'WCEOF'
+            package com.example.wcbot
+
+            import android.content.Context
+
+            /** Textes de l'appli en français et en anglais. */
+            object L {
+                @JvmField var lang: String = "fr"
+
+                fun init(ctx: Context) {
+                    lang = ctx.getSharedPreferences("app", Context.MODE_PRIVATE).getString("lang", "fr") ?: "fr"
+                }
+
+                fun set(ctx: Context, l: String) {
+                    lang = l
+                    ctx.getSharedPreferences("app", Context.MODE_PRIVATE).edit().putString("lang", l).apply()
+                }
+
+                fun t(k: String): String = (if (lang == "en") en[k] else fr[k]) ?: fr[k] ?: k
+
+                private val fr = mapOf(
+                    "tab_home" to "ACCUEIL", "tab_profiles" to "PROFILS", "tab_commands" to "COMMANDES", "tab_settings" to "RÉGLAGES",
+                    "prompt" to "root@tablette:~$ ./wildcraft_bot --ready",
+                    "active_profile" to "Profil actif",
+                    "st_pos" to "positions", "st_zone" to "zone de vie", "st_acc" to "accessibilité", "st_img" to "images PNJ / BOSS",
+                    "to_3a" to "à placer (3a)", "to_3b" to "à placer (3b)", "off_1b" to "OFF (1b)",
+                    "sec_perm" to "AUTORISATIONS", "sec_pos" to "POSITIONS", "sec_launch" to "LANCEMENT",
+                    "b_overlay" to "1a. Autoriser l'affichage par-dessus les applis",
+                    "b_access" to "1b. Activer le service d'accessibilité",
+                    "b_3a" to "3a. Placer le joystick et le bouton d'attaque",
+                    "b_3b" to "3b. Placer la zone du nombre de vie (ciblez un monstre avant)",
+                    "b_test" to "Test des gestes (dans 8 s : appui attaque, puis joystick tenu 3 s)",
+                    "b_start" to "DÉMARRER  (puis ouvrez WildCraft)",
+                    "b_quit" to "[ QUITTER LE BOT ]",
+                    "tip_play" to "En jeu : le bouton flottant se déplace au doigt, ≡ ouvre les réglages rapides, et un appui long dessus quitte le bot.",
+                    "t_overlay" to "Autorisez d'abord l'affichage par-dessus les applis (1a)",
+                    "t_access" to "Activez d'abord le service d'accessibilité (1b)",
+                    "t_pos" to "Placez d'abord le joystick et le bouton d'attaque (3a)",
+                    "t_zone" to "Placez d'abord la zone du nombre de vie (3b)",
+                    "t_images" to "Ajoutez au moins une image (Réglages, détection par images)",
+                    "t_stopped" to "Bot arrêté",
+                    "t_calib" to "Ouvrez WildCraft : le réglage démarre dans 12 secondes",
+                    "t_test" to "Ouvrez WildCraft : test dans 8 secondes",
+                    "t_added" to "image(s) ajoutée(s)",
+                    "t_open" to "Ouvrez WildCraft et utilisez le bouton flottant ▶",
+                    "prof_hint" to "Chaque profil garde ses propres positions, réglages et commandes (ex : Solo, Multi).",
+                    "sec_profiles" to "PROFILS ENREGISTRÉS", "prof_active" to "actif", "prof_new" to "NOUVEAU PROFIL",
+                    "prof_name" to "Nom du profil", "prof_create" to "Créer le profil", "prof_dup" to "Dupliquer le profil actif",
+                    "prof_exists" to "Ce nom existe déjà", "prof_empty" to "Donnez un nom au profil",
+                    "prof_del_q" to "Supprimer ce profil et ses commandes ?", "yes" to "Oui", "no" to "Non",
+                    "cmd_hint" to "Une commande appuie toute seule sur un point de l'écran de jeu. Elle est propre au profil actif.",
+                    "sec_cmds" to "COMMANDES", "cmd_add" to "+ Ajouter une commande", "cmd_none" to "Aucune commande pour ce profil.",
+                    "cmd_name" to "Nom (ex : Manger)", "cmd_action" to "Action", "cmd_tap" to "Appui", "cmd_hold" to "Maintien",
+                    "cmd_ms" to "Durée du maintien (ms)", "cmd_when" to "Quand",
+                    "cmd_t0" to "Toujours", "cmd_t1" to "Face à un PNJ", "cmd_t2" to "Face à un boss",
+                    "cmd_every" to "Toutes les (secondes)", "cmd_save" to "Enregistrer", "cmd_cancel" to "Annuler",
+                    "cmd_edit" to "Modifier", "cmd_place" to "Placer", "cmd_del" to "Supprimer",
+                    "cmd_unplaced" to "position non placée", "cmd_placed" to "position OK",
+                    "cmd_new" to "Nouvelle commande", "cmd_edit_t" to "Modifier la commande",
+                    "cmd_pos_step" to "Touchez l'endroit du bouton", "cmd_pos_ok" to "Position enregistrée ✔",
+                    "s_tap" to "appui", "s_hold" to "maintien", "s_every" to "toutes les",
+                    "sec_lang" to "LANGUE", "sec_detect" to "DÉTECTION", "sec_boss" to "COMBAT DE BOSS", "sec_adv" to "AVANCÉ : DÉTECTION PAR IMAGES",
+                    "set_method" to "Lire le nombre de vie (désactivé = détection par images)",
+                    "set_hpboss" to "Vie à partir de laquelle c'est un BOSS (ex : 10000)",
+                    "set_miss" to "Lectures ratées avant la fin du boss (1 = environ 0,3 s)",
+                    "set_fixed" to "Joystick en mode fixe (désactivé = libre)",
+                    "set_dir" to "Direction tenue autour du boss",
+                    "set_radius" to "Amplitude du joystick",
+                    "set_atk" to "Taper sur l'attaque pendant le boss",
+                    "set_tol" to "Boss : tolérance de couleur de la barre",
+                    "set_thrnpc" to "PNJ : sensibilité (%)",
+                    "set_thrboss" to "Boss : part de la barre à retrouver (%)",
+                    "img_info" to "PNJ : images rognées du PNJ (nom ou icône). BOSS : partie colorée de la barre de vie, sans bord ni fond.",
+                    "b_img_npc" to "PNJ : ajouter des images", "b_img_boss" to "BOSS : ajouter des images de barre de vie",
+                    "b_clr_npc" to "Effacer les images de PNJ", "b_clr_boss" to "Effacer les images de boss",
+                    "c_joy" to "Touchez le CENTRE du joystick de déplacement",
+                    "c_btn" to "Touchez le bouton d'ATTAQUE",
+                    "c_z1" to "Touchez le coin HAUT-GAUCHE de la zone du nombre de vie",
+                    "c_z2" to "Touchez le coin BAS-DROIT de cette zone (autour du nombre seulement)",
+                    "c_done_btn" to "Positions enregistrées ✔", "c_done_zone" to "Zone du nombre de vie enregistrée ✔",
+                    "c_cancel" to "Annuler",
+                    "o_title" to "// RÉGLAGES EN JEU (effet au prochain boss)",
+                    "o_dir" to "Direction (°)", "o_hp" to "Boss si vie ≥", "o_radius" to "Amplitude joystick",
+                    "o_atk" to "Attaque pendant boss", "o_yes" to "OUI", "o_no" to "NON",
+                    "o_joy" to "Joystick", "o_fixed" to "FIXE", "o_free" to "LIBRE", "o_quit" to "[ QUITTER LE BOT ]",
+                    "o_noimg" to "pas d'image reçue", "o_nonum" to "aucun nombre lu", "o_accoff" to "ACCESSIBILITÉ OFF", "o_life" to "vie"
+                )
+
+                private val en = mapOf(
+                    "tab_home" to "HOME", "tab_profiles" to "PROFILES", "tab_commands" to "COMMANDS", "tab_settings" to "SETTINGS",
+                    "prompt" to "root@tablet:~$ ./wildcraft_bot --ready",
+                    "active_profile" to "Active profile",
+                    "st_pos" to "controls", "st_zone" to "HP zone", "st_acc" to "accessibility", "st_img" to "NPC / BOSS images",
+                    "to_3a" to "to place (3a)", "to_3b" to "to place (3b)", "off_1b" to "OFF (1b)",
+                    "sec_perm" to "PERMISSIONS", "sec_pos" to "POSITIONS", "sec_launch" to "LAUNCH",
+                    "b_overlay" to "1a. Allow display over other apps",
+                    "b_access" to "1b. Enable the accessibility service",
+                    "b_3a" to "3a. Place the joystick and the attack button",
+                    "b_3b" to "3b. Place the HP number zone (target a monster first)",
+                    "b_test" to "Gesture test (in 8 s: attack tap, then joystick held 3 s)",
+                    "b_start" to "START  (then open WildCraft)",
+                    "b_quit" to "[ QUIT THE BOT ]",
+                    "tip_play" to "In game: drag the floating button anywhere, ≡ opens quick settings, and a long press on it quits the bot.",
+                    "t_overlay" to "First allow display over other apps (1a)",
+                    "t_access" to "First enable the accessibility service (1b)",
+                    "t_pos" to "First place the joystick and the attack button (3a)",
+                    "t_zone" to "First place the HP number zone (3b)",
+                    "t_images" to "Add at least one image (Settings, image detection)",
+                    "t_stopped" to "Bot stopped",
+                    "t_calib" to "Open WildCraft: setup starts in 12 seconds",
+                    "t_test" to "Open WildCraft: test in 8 seconds",
+                    "t_added" to "image(s) added",
+                    "t_open" to "Open WildCraft and use the floating ▶ button",
+                    "prof_hint" to "Each profile keeps its own positions, settings and commands (e.g. Solo, Multi).",
+                    "sec_profiles" to "SAVED PROFILES", "prof_active" to "active", "prof_new" to "NEW PROFILE",
+                    "prof_name" to "Profile name", "prof_create" to "Create profile", "prof_dup" to "Duplicate the active profile",
+                    "prof_exists" to "This name already exists", "prof_empty" to "Give the profile a name",
+                    "prof_del_q" to "Delete this profile and its commands?", "yes" to "Yes", "no" to "No",
+                    "cmd_hint" to "A command taps a point of the game screen by itself. It belongs to the active profile.",
+                    "sec_cmds" to "COMMANDS", "cmd_add" to "+ Add a command", "cmd_none" to "No command for this profile.",
+                    "cmd_name" to "Name (e.g. Eat)", "cmd_action" to "Action", "cmd_tap" to "Tap", "cmd_hold" to "Hold",
+                    "cmd_ms" to "Hold duration (ms)", "cmd_when" to "When",
+                    "cmd_t0" to "Always", "cmd_t1" to "Facing an NPC", "cmd_t2" to "Facing a boss",
+                    "cmd_every" to "Every (seconds)", "cmd_save" to "Save", "cmd_cancel" to "Cancel",
+                    "cmd_edit" to "Edit", "cmd_place" to "Place", "cmd_del" to "Delete",
+                    "cmd_unplaced" to "position not placed", "cmd_placed" to "position OK",
+                    "cmd_new" to "New command", "cmd_edit_t" to "Edit command",
+                    "cmd_pos_step" to "Touch the spot of the button", "cmd_pos_ok" to "Position saved ✔",
+                    "s_tap" to "tap", "s_hold" to "hold", "s_every" to "every",
+                    "sec_lang" to "LANGUAGE", "sec_detect" to "DETECTION", "sec_boss" to "BOSS FIGHT", "sec_adv" to "ADVANCED: IMAGE DETECTION",
+                    "set_method" to "Read the HP number (off = image detection)",
+                    "set_hpboss" to "HP from which it is a BOSS (e.g. 10000)",
+                    "set_miss" to "Failed reads before the boss is over (1 = about 0.3 s)",
+                    "set_fixed" to "Fixed joystick mode (off = free)",
+                    "set_dir" to "Direction held around the boss",
+                    "set_radius" to "Joystick amplitude",
+                    "set_atk" to "Tap attack during the boss",
+                    "set_tol" to "Boss: bar color tolerance",
+                    "set_thrnpc" to "NPC: sensitivity (%)",
+                    "set_thrboss" to "Boss: share of the bar to find (%)",
+                    "img_info" to "NPC: cropped images of the NPC (name or icon). BOSS: colored part of the health bar, no border or background.",
+                    "b_img_npc" to "NPC: add images", "b_img_boss" to "BOSS: add health bar images",
+                    "b_clr_npc" to "Clear NPC images", "b_clr_boss" to "Clear boss images",
+                    "c_joy" to "Touch the CENTER of the movement joystick",
+                    "c_btn" to "Touch the ATTACK button",
+                    "c_z1" to "Touch the TOP-LEFT corner of the HP number zone",
+                    "c_z2" to "Touch the BOTTOM-RIGHT corner of this zone (around the number only)",
+                    "c_done_btn" to "Positions saved ✔", "c_done_zone" to "HP number zone saved ✔",
+                    "c_cancel" to "Cancel",
+                    "o_title" to "// IN-GAME SETTINGS (applies to the next boss)",
+                    "o_dir" to "Direction (°)", "o_hp" to "Boss if HP ≥", "o_radius" to "Joystick amplitude",
+                    "o_atk" to "Attack during boss", "o_yes" to "YES", "o_no" to "NO",
+                    "o_joy" to "Joystick", "o_fixed" to "FIXED", "o_free" to "FREE", "o_quit" to "[ QUIT THE BOT ]",
+                    "o_noimg" to "no image received", "o_nonum" to "no number read", "o_accoff" to "ACCESSIBILITY OFF", "o_life" to "HP"
+                )
+            }
+            WCEOF
+            mkdir -p app/src/main/java/com/example/wcbot
             cat > app/src/main/java/com/example/wcbot/MainActivity.kt <<'WCEOF'
             package com.example.wcbot
 
             import android.app.Activity
+            import android.app.AlertDialog
             import android.content.Intent
             import android.content.res.ColorStateList
             import android.graphics.Typeface
@@ -984,18 +1265,26 @@ jobs:
             import android.net.Uri
             import android.os.Bundle
             import android.provider.Settings
+            import android.text.Editable
+            import android.text.InputType
             import android.text.SpannableStringBuilder
             import android.text.Spanned
+            import android.text.TextWatcher
             import android.text.style.ForegroundColorSpan
             import android.util.DisplayMetrics
             import android.view.Gravity
             import android.view.ViewGroup
             import android.widget.Button
             import android.widget.EditText
+            import android.widget.FrameLayout
             import android.widget.LinearLayout
             import android.widget.ScrollView
+            import android.widget.SeekBar
+            import android.widget.Switch
             import android.widget.TextView
             import android.widget.Toast
+            import org.json.JSONArray
+            import org.json.JSONObject
             import java.io.File
 
             class MainActivity : Activity() {
@@ -1008,31 +1297,20 @@ jobs:
                 private val BG = 0xFF050A05.toInt()
                 private val PANEL = 0xFF0D1A0D.toInt()
                 private val CARD = 0xFF081008.toInt()
-
-                private val fields = LinkedHashMap<String, EditText>()
-                private val defaults = linkedMapOf(
-                    "ocr" to 1, "hpBoss" to 10000, "radius" to 90, "fixed" to 1, "dir" to 0, "bossMiss" to 4, "atkBoss" to 0,
-                    "tolColor" to 35, "thrNpc" to 75, "thrBoss" to 75
-                )
-                private val labels = mapOf(
-                    "ocr" to "Méthode : 1 = lire le nombre de vie (recommandé), 0 = reconnaissance par images",
-                    "hpBoss" to "Vie à partir de laquelle c'est un BOSS (ex : 10000)",
-                    "radius" to "Amplitude du joystick (pixels)",
-                    "fixed" to "Joystick en mode FIXE (1 = fixe, 0 = libre)",
-                    "dir" to "Direction tenue autour du boss, en degrés (0=droite, 90=bas, 180=gauche, 270=haut)",
-                    "bossMiss" to "Vérifications sans barre avant la fin du boss (1 = environ 0,3 s)",
-                    "atkBoss" to "Taper sur le bouton d'attaque pendant le tour du boss (1 = oui, 0 = non)",
-                    "tolColor" to "Boss : tolérance sur la couleur de la barre (plus grand = plus souple)",
-                    "thrNpc" to "PNJ : sensibilité de détection (%)",
-                    "thrBoss" to "Boss : part de la longueur de votre image de barre à retrouver (%)"
-                )
                 private val PICK_NPC = 1
                 private val PICK_BOSS = 2
                 private val REQ_CAPTURE = 3
+
+                private var tab = 0
+                private var content: FrameLayout? = null
+                private var tabBar: LinearLayout? = null
                 private var status: TextView? = null
 
+                private fun cfg() = Store.cfg(this)
                 private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+                private fun toast(k: String) { Toast.makeText(this, L.t(k), Toast.LENGTH_LONG).show() }
 
+                // ---------------------------------------------------------------- style
                 private fun outline(stroke: Int, fill: Int, radius: Int): GradientDrawable {
                     val d = GradientDrawable()
                     d.setColor(fill)
@@ -1046,9 +1324,7 @@ jobs:
                     sl.addState(intArrayOf(android.R.attr.state_pressed), outline(color, color, 6))
                     sl.addState(intArrayOf(), outline(color, PANEL, 6))
                     b.background = sl
-                    b.setTextColor(
-                        ColorStateList(arrayOf(intArrayOf(android.R.attr.state_pressed), intArrayOf()), intArrayOf(BG, color))
-                    )
+                    b.setTextColor(ColorStateList(arrayOf(intArrayOf(android.R.attr.state_pressed), intArrayOf()), intArrayOf(BG, color)))
                     b.typeface = Typeface.MONOSPACE
                     b.setAllCaps(false)
                     b.textSize = 14f
@@ -1056,119 +1332,222 @@ jobs:
                     b.setPadding(dp(14), dp(10), dp(14), dp(10))
                 }
 
-                override fun onCreate(savedInstanceState: Bundle?) {
-                    super.onCreate(savedInstanceState)
-                    window.statusBarColor = BG
-                    window.navigationBarColor = BG
-                    val prefs = getSharedPreferences("cfg", MODE_PRIVATE)
+                private fun styleSwitch(sw: Switch) {
+                    val checked = intArrayOf(android.R.attr.state_checked)
+                    sw.thumbTintList = ColorStateList(arrayOf(checked, intArrayOf()), intArrayOf(GREEN, 0xFF7A7A7A.toInt()))
+                    sw.trackTintList = ColorStateList(arrayOf(checked, intArrayOf()), intArrayOf(0xFF0B5A25.toInt(), 0xFF2A2A2A.toInt()))
+                }
+
+                private fun lp(top: Int): LinearLayout.LayoutParams {
+                    val l = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                    l.topMargin = dp(top)
+                    return l
+                }
+
+                private fun newPage(): Pair<ScrollView, LinearLayout> {
                     val sv = ScrollView(this)
                     sv.setBackgroundColor(BG)
                     sv.isVerticalScrollBarEnabled = false
                     val box = LinearLayout(this)
                     box.orientation = LinearLayout.VERTICAL
-                    box.setPadding(dp(18), dp(18), dp(18), dp(30))
+                    box.setPadding(dp(18), dp(18), dp(18), dp(24))
                     sv.addView(box)
+                    return Pair(sv, box)
+                }
 
-                    fun lp(top: Int): LinearLayout.LayoutParams {
-                        val l = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-                        l.topMargin = dp(top)
-                        return l
+                private fun text(parent: LinearLayout, t: String, color: Int, size: Float, top: Int): TextView {
+                    val tv = TextView(this)
+                    tv.text = t
+                    tv.setTextColor(color)
+                    tv.typeface = Typeface.MONOSPACE
+                    tv.textSize = size
+                    parent.addView(tv, lp(top))
+                    return tv
+                }
+
+                private fun section(box: LinearLayout, title: String): LinearLayout {
+                    text(box, "── " + title + " ──", CYAN, 13f, 22)
+                    val card = LinearLayout(this)
+                    card.orientation = LinearLayout.VERTICAL
+                    card.background = outline(DIM, CARD, 8)
+                    card.setPadding(dp(12), dp(6), dp(12), dp(14))
+                    box.addView(card, lp(8))
+                    return card
+                }
+
+                private fun button(parent: LinearLayout, t: String, color: Int, action: () -> Unit): Button {
+                    val b = Button(this)
+                    b.text = "▸ " + t
+                    styled(b, color)
+                    b.setOnClickListener { action() }
+                    parent.addView(b, lp(8))
+                    return b
+                }
+
+                private fun switchRow(parent: LinearLayout, labelKey: String, key: String, def: Int) {
+                    val row = LinearLayout(this)
+                    row.orientation = LinearLayout.HORIZONTAL
+                    row.gravity = Gravity.CENTER_VERTICAL
+                    val tv = TextView(this)
+                    tv.text = L.t(labelKey)
+                    tv.setTextColor(SOFT)
+                    tv.typeface = Typeface.MONOSPACE
+                    tv.textSize = 13f
+                    val sw = Switch(this)
+                    styleSwitch(sw)
+                    sw.isChecked = cfg().getInt(key, def) == 1
+                    sw.setOnCheckedChangeListener { _, c -> cfg().edit().putInt(key, if (c) 1 else 0).apply() }
+                    row.addView(tv, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                    row.addView(sw)
+                    parent.addView(row, lp(12))
+                }
+
+                private fun numField(parent: LinearLayout, labelKey: String, key: String, def: Int) {
+                    text(parent, L.t(labelKey), SOFT, 12f, 12)
+                    val et = EditText(this)
+                    et.setText(cfg().getInt(key, def).toString())
+                    et.inputType = InputType.TYPE_CLASS_NUMBER
+                    et.setTextColor(GREEN)
+                    et.typeface = Typeface.MONOSPACE
+                    et.background = outline(DIM, PANEL, 4)
+                    et.setPadding(dp(12), dp(8), dp(12), dp(8))
+                    et.addTextChangedListener(object : TextWatcher {
+                        override fun afterTextChanged(s: Editable?) {
+                            val v = s?.toString()?.toIntOrNull()
+                            if (v != null) cfg().edit().putInt(key, v).apply()
+                        }
+                        override fun beforeTextChanged(s: CharSequence?, st: Int, c: Int, a: Int) {}
+                        override fun onTextChanged(s: CharSequence?, st: Int, b: Int, c: Int) {}
+                    })
+                    parent.addView(et, lp(4))
+                }
+
+                /** Boutons de choix (un seul actif), rangés par lignes de perRow. */
+                private fun choices(parent: LinearLayout, labels: List<String>, current: Int, perRow: Int, onSel: (Int) -> Unit) {
+                    var cur = current
+                    val btns = ArrayList<Button>()
+                    fun paint() {
+                        for ((i, b) in btns.withIndex()) {
+                            val sel = i == cur
+                            b.background = outline(if (sel) GREEN else DIM, if (sel) 0xFF123A18.toInt() else PANEL, 6)
+                            b.setTextColor(if (sel) GREEN else DIM)
+                        }
                     }
-
-                    fun text(parent: LinearLayout, t: String, color: Int, size: Float, top: Int): TextView {
-                        val tv = TextView(this)
-                        tv.text = t
-                        tv.setTextColor(color)
-                        tv.typeface = Typeface.MONOSPACE
-                        tv.textSize = size
-                        parent.addView(tv, lp(top))
-                        return tv
-                    }
-
-                    fun section(num: String, title: String): LinearLayout {
-                        text(box, "── " + num + " · " + title + " ──", CYAN, 13f, 24)
-                        val card = LinearLayout(this)
-                        card.orientation = LinearLayout.VERTICAL
-                        card.background = outline(DIM, CARD, 8)
-                        card.setPadding(dp(12), dp(6), dp(12), dp(14))
-                        box.addView(card, lp(8))
-                        return card
-                    }
-
-                    fun button(parent: LinearLayout, t: String, color: Int, action: () -> Unit) {
+                    var row: LinearLayout? = null
+                    for ((i, t) in labels.withIndex()) {
+                        if (i % perRow == 0) {
+                            val r = LinearLayout(this)
+                            r.orientation = LinearLayout.HORIZONTAL
+                            parent.addView(r, lp(8))
+                            row = r
+                        }
                         val b = Button(this)
-                        b.text = "▸ " + t
-                        styled(b, color)
-                        b.setOnClickListener { action() }
-                        parent.addView(b, lp(8))
+                        b.text = t
+                        b.typeface = Typeface.MONOSPACE
+                        b.setAllCaps(false)
+                        b.textSize = 13f
+                        b.minWidth = 0
+                        b.setPadding(dp(6), dp(8), dp(6), dp(8))
+                        b.setOnClickListener { cur = i; paint(); onSel(i) }
+                        val l = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                        l.rightMargin = dp(6)
+                        row?.addView(b, l)
+                        btns.add(b)
                     }
+                    paint()
+                }
 
-                    text(box, "root@tablette:~$ ./wildcraft_bot --ready", DIM, 12f, 0)
+                // ---------------------------------------------------------------- squelette + onglets
+                override fun onCreate(savedInstanceState: Bundle?) {
+                    super.onCreate(savedInstanceState)
+                    L.init(this)
+                    window.statusBarColor = BG
+                    window.navigationBarColor = PANEL
+                    val root = LinearLayout(this)
+                    root.orientation = LinearLayout.VERTICAL
+                    root.setBackgroundColor(BG)
+                    val c = FrameLayout(this)
+                    content = c
+                    root.addView(c, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+                    val bar = LinearLayout(this)
+                    bar.orientation = LinearLayout.HORIZONTAL
+                    bar.setBackgroundColor(PANEL)
+                    bar.setPadding(dp(6), dp(6), dp(6), dp(6))
+                    tabBar = bar
+                    root.addView(bar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+                    setContentView(root)
+                    showTab(0)
+                }
+
+                override fun onResume() {
+                    super.onResume()
+                    if (tab == 0) refreshStatus()
+                }
+
+                private fun showTab(i: Int) {
+                    tab = i
+                    val bar = tabBar ?: return
+                    bar.removeAllViews()
+                    val names = listOf("tab_home", "tab_profiles", "tab_commands", "tab_settings")
+                    for ((idx, k) in names.withIndex()) {
+                        val b = Button(this)
+                        b.text = L.t(k)
+                        b.typeface = Typeface.MONOSPACE
+                        b.setAllCaps(false)
+                        b.textSize = 11f
+                        b.minWidth = 0
+                        b.setPadding(dp(4), dp(10), dp(4), dp(10))
+                        if (idx == i) {
+                            b.background = outline(GREEN, CARD, 6)
+                            b.setTextColor(GREEN)
+                        } else {
+                            b.setBackgroundColor(0)
+                            b.setTextColor(DIM)
+                        }
+                        b.setOnClickListener { showTab(idx) }
+                        bar.addView(b, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                    }
+                    val c = content ?: return
+                    c.removeAllViews()
+                    c.addView(
+                        when (i) {
+                            0 -> tabHome()
+                            1 -> tabProfiles()
+                            2 -> tabCommands()
+                            else -> tabSettings()
+                        }
+                    )
+                }
+
+                // ---------------------------------------------------------------- onglet ACCUEIL
+                private fun tabHome(): ScrollView {
+                    val (sv, box) = newPage()
+                    text(box, L.t("prompt"), DIM, 12f, 0)
                     text(box, "> " + getString(R.string.app_name).uppercase() + "_", GREEN, 26f, 4)
+                    text(box, L.t("active_profile") + " : " + Store.active(this), CYAN, 13f, 6)
                     val st = text(box, "", GREEN, 13f, 12)
                     st.background = outline(DIM, PANEL, 8)
                     st.setPadding(dp(12), dp(10), dp(12), dp(10))
                     status = st
 
-                    val s1 = section("01", "AUTORISATIONS")
-                    button(s1, "1a. Autoriser l'affichage par-dessus les applis", GREEN) {
+                    val s1 = section(box, L.t("sec_perm"))
+                    button(s1, L.t("b_overlay"), GREEN) {
                         startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + packageName)))
                     }
-                    button(s1, "1b. Activer le service d'accessibilité", GREEN) {
-                        startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-                    }
+                    button(s1, L.t("b_access"), GREEN) { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
 
-                    val s2 = section("02", "CIBLES PAR IMAGES (inutile si Méthode = 1)")
-                    text(
-                        s2,
-                        "PNJ : images rognées du PNJ (son nom ou une icône).\n" +
-                            "BOSS : une image de la partie COLORÉE de sa barre de vie, sans bord ni fond. " +
-                            "Une image par couleur si la barre change de couleur.",
-                        SOFT, 12f, 6
-                    )
-                    button(s2, "2a. PNJ : ajouter des images", GREEN) { pick(PICK_NPC) }
-                    button(s2, "2b. BOSS : ajouter des images de barre de vie", GREEN) { pick(PICK_BOSS) }
-                    button(s2, "Effacer les images de PNJ", AMBER) { clear("npc_") }
-                    button(s2, "Effacer les images de boss", AMBER) { clear("boss_") }
+                    val s2 = section(box, L.t("sec_pos"))
+                    button(s2, L.t("b_3a"), CYAN) { calibrate("buttons", -1, "") }
+                    button(s2, L.t("b_3b"), CYAN) { calibrate("zone", -1, "") }
+                    button(s2, L.t("b_test"), AMBER) { testGestures() }
 
-                    val s3 = section("03", "POSITIONS")
-                    button(s3, "3a. Placer le joystick et le bouton d'attaque", CYAN) { calibrate("buttons") }
-                    button(s3, "3b. Placer la zone du nombre de vie (ciblez un monstre avant)", CYAN) { calibrate("zone") }
-                    button(s3, "Test des gestes (dans 8 s : appui attaque, puis joystick tenu 3 s)", AMBER) { testGestures() }
-
-                    val s4 = section("04", "REGLAGES")
-                    for ((k, d) in defaults) {
-                        text(s4, labels[k] ?: k, SOFT, 12f, 12)
-                        val et = EditText(this)
-                        et.setText(prefs.getInt(k, d).toString())
-                        et.inputType = android.text.InputType.TYPE_CLASS_NUMBER
-                        et.setTextColor(GREEN)
-                        et.typeface = Typeface.MONOSPACE
-                        et.background = outline(DIM, PANEL, 4)
-                        et.setPadding(dp(12), dp(8), dp(12), dp(8))
-                        s4.addView(et, lp(4))
-                        fields[k] = et
-                    }
-
-                    val s5 = section("05", "LANCEMENT")
-                    button(s5, "4. DEMARRER  (puis ouvrez WildCraft)", GREEN) { start() }
-                    button(s5, "[ QUITTER LE BOT ]", RED) { quitBot() }
-                    text(
-                        s5,
-                        "En jeu : le bouton flottant se déplace au doigt, ≡ ouvre les réglages rapides, " +
-                            "et un appui long dessus quitte le bot.",
-                        SOFT, 12f, 10
-                    )
-                    setContentView(sv)
-                }
-
-                override fun onResume() {
-                    super.onResume()
+                    val s3 = section(box, L.t("sec_launch"))
+                    button(s3, L.t("b_start"), GREEN) { start() }
+                    button(s3, L.t("b_quit"), RED) { quitBot() }
+                    text(s3, L.t("tip_play"), SOFT, 12f, 10)
                     refreshStatus()
+                    return sv
                 }
-
-                private fun count(prefix: String): Int =
-                    (filesDir.listFiles() ?: emptyArray()).count { it.name.startsWith(prefix) }
 
                 private fun statusLine(sb: SpannableStringBuilder, ok: Boolean, label: String, value: String) {
                     val start = sb.length
@@ -1177,29 +1556,269 @@ jobs:
                     sb.append(label).append(" : ").append(value).append("\n")
                 }
 
+                private fun count(prefix: String): Int =
+                    (filesDir.listFiles() ?: emptyArray()).count { it.name.startsWith(prefix) }
+
                 private fun refreshStatus() {
-                    val cfg = getSharedPreferences("cfg", MODE_PRIVATE)
-                    val pos = cfg.contains("joyFX") && cfg.contains("btnFX")
-                    val zone = cfg.contains("hp1FX") && cfg.contains("hp2FX")
+                    val c = cfg()
+                    val pos = c.contains("joyFX") && c.contains("btnFX")
+                    val zone = c.contains("hp1FX") && c.contains("hp2FX")
                     val acc = BotAccessibility.instance != null
                     val sb = SpannableStringBuilder()
-                    statusLine(sb, pos, "positions", if (pos) "OK" else "à placer (3a)")
-                    statusLine(sb, zone, "zone de vie", if (zone) "OK" else "à placer (3b)")
-                    statusLine(sb, acc, "accessibilité", if (acc) "ON" else "OFF (1b)")
-                    statusLine(sb, true, "images PNJ / BOSS", count("npc_").toString() + " / " + count("boss_").toString())
+                    statusLine(sb, pos, L.t("st_pos"), if (pos) "OK" else L.t("to_3a"))
+                    statusLine(sb, zone, L.t("st_zone"), if (zone) "OK" else L.t("to_3b"))
+                    statusLine(sb, acc, L.t("st_acc"), if (acc) "ON" else L.t("off_1b"))
+                    statusLine(sb, true, L.t("st_img"), count("npc_").toString() + " / " + count("boss_").toString())
                     status?.text = sb
+                }
+
+                // ---------------------------------------------------------------- onglet PROFILS
+                private fun tabProfiles(): ScrollView {
+                    val (sv, box) = newPage()
+                    text(box, L.t("tab_profiles"), GREEN, 22f, 0)
+                    text(box, L.t("prof_hint"), SOFT, 12f, 6)
+                    val list = section(box, L.t("sec_profiles"))
+                    val active = Store.active(this)
+                    for (name in Store.profiles(this)) {
+                        val row = LinearLayout(this)
+                        row.orientation = LinearLayout.HORIZONTAL
+                        val isActive = name == active
+                        val b = Button(this)
+                        b.text = (if (isActive) "● " else "○ ") + name + (if (isActive) "   [" + L.t("prof_active") + "]" else "")
+                        styled(b, if (isActive) GREEN else DIM)
+                        b.setOnClickListener { Store.setActive(this, name); showTab(1) }
+                        row.addView(b, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                        if (!isActive) {
+                            val d = Button(this)
+                            d.text = "✕"
+                            styled(d, RED)
+                            d.gravity = Gravity.CENTER
+                            d.setOnClickListener { confirmDelete(name) }
+                            val l = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                            l.leftMargin = dp(8)
+                            row.addView(d, l)
+                        }
+                        list.addView(row, lp(8))
+                    }
+
+                    val s2 = section(box, L.t("prof_new"))
+                    val et = EditText(this)
+                    et.hint = L.t("prof_name")
+                    et.setHintTextColor(DIM)
+                    et.setTextColor(GREEN)
+                    et.typeface = Typeface.MONOSPACE
+                    et.background = outline(DIM, PANEL, 4)
+                    et.setPadding(dp(12), dp(8), dp(12), dp(8))
+                    et.setSingleLine(true)
+                    s2.addView(et, lp(8))
+                    button(s2, L.t("prof_create"), GREEN) {
+                        val n = et.text.toString().trim()
+                        if (n.isEmpty()) toast("prof_empty")
+                        else if (Store.exists(this, n)) toast("prof_exists")
+                        else { Store.add(this, n); Store.setActive(this, n); showTab(1) }
+                    }
+                    button(s2, L.t("prof_dup"), CYAN) {
+                        val base = active + " 2"
+                        var n = base
+                        var k = 2
+                        while (Store.exists(this, n)) { k++; n = active + " " + k }
+                        Store.duplicate(this, active, n)
+                        Store.setActive(this, n)
+                        showTab(1)
+                    }
+                    return sv
+                }
+
+                private fun confirmDelete(name: String) {
+                    AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                        .setMessage(L.t("prof_del_q") + "\n" + name)
+                        .setPositiveButton(L.t("yes")) { _, _ -> Store.delete(this, name); showTab(1) }
+                        .setNegativeButton(L.t("no"), null)
+                        .show()
+                }
+
+                // ---------------------------------------------------------------- onglet COMMANDES
+                private fun cmdArray(): JSONArray =
+                    try { JSONArray(cfg().getString("cmds", "[]")) } catch (e: Exception) { JSONArray() }
+
+                private fun saveCmds(a: JSONArray) { cfg().edit().putString("cmds", a.toString()).apply() }
+
+                private fun tabCommands(): ScrollView {
+                    val (sv, box) = newPage()
+                    text(box, L.t("tab_commands"), GREEN, 22f, 0)
+                    text(box, L.t("cmd_hint"), SOFT, 12f, 6)
+                    val arr = cmdArray()
+                    val list = section(box, L.t("sec_cmds") + " · " + Store.active(this))
+                    if (arr.length() == 0) text(list, L.t("cmd_none"), SOFT, 13f, 8)
+                    for (i in 0 until arr.length()) {
+                        val o = arr.getJSONObject(i)
+                        val head = LinearLayout(this)
+                        head.orientation = LinearLayout.HORIZONTAL
+                        head.gravity = Gravity.CENTER_VERTICAL
+                        val nameTv = TextView(this)
+                        nameTv.text = o.optString("n", "?")
+                        nameTv.setTextColor(GREEN)
+                        nameTv.typeface = Typeface.MONOSPACE
+                        nameTv.textSize = 16f
+                        val sw = Switch(this)
+                        styleSwitch(sw)
+                        sw.isChecked = o.optInt("e", 1) == 1
+                        sw.setOnCheckedChangeListener { _, c ->
+                            val a = cmdArray()
+                            a.getJSONObject(i).put("e", if (c) 1 else 0)
+                            saveCmds(a)
+                        }
+                        head.addView(nameTv, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                        head.addView(sw)
+                        list.addView(head, lp(14))
+
+                        val placed = o.optDouble("x", -1.0) >= 0
+                        val action = if (o.optInt("a", 0) == 1) L.t("s_hold") + " " + o.optInt("ms", 600) + " ms" else L.t("s_tap")
+                        val summary = action + " · " + L.t("s_every") + " " + o.optInt("s", 30) + " s · " +
+                            L.t("cmd_t" + o.optInt("t", 0)) + "\n" + (if (placed) L.t("cmd_placed") else L.t("cmd_unplaced"))
+                        text(list, summary, if (placed) SOFT else AMBER, 12f, 4)
+
+                        val row = LinearLayout(this)
+                        row.orientation = LinearLayout.HORIZONTAL
+                        fun small(t: String, color: Int, a: () -> Unit) {
+                            val b = Button(this)
+                            b.text = t
+                            styled(b, color)
+                            b.textSize = 12f
+                            b.gravity = Gravity.CENTER
+                            b.setOnClickListener { a() }
+                            val l = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                            l.rightMargin = dp(6)
+                            row.addView(b, l)
+                        }
+                        small(L.t("cmd_edit"), GREEN) { editCommand(i) }
+                        small(L.t("cmd_place"), CYAN) { calibrate("cmd", i, o.optString("n", "")) }
+                        small(L.t("cmd_del"), RED) {
+                            val a = cmdArray()
+                            a.remove(i)
+                            saveCmds(a)
+                            showTab(2)
+                        }
+                        list.addView(row, lp(8))
+                    }
+                    button(box, L.t("cmd_add"), GREEN) { editCommand(-1) }
+                    return sv
+                }
+
+                private fun editCommand(idx: Int) {
+                    val arr = cmdArray()
+                    val old = if (idx >= 0) arr.getJSONObject(idx) else JSONObject()
+                    var action = old.optInt("a", 0)
+                    var trig = old.optInt("t", 0)
+
+                    val sv = ScrollView(this)
+                    sv.setBackgroundColor(BG)
+                    val box = LinearLayout(this)
+                    box.orientation = LinearLayout.VERTICAL
+                    box.setPadding(dp(16), dp(16), dp(16), dp(8))
+                    sv.addView(box)
+
+                    fun field(hint: String, value: String, numeric: Boolean): EditText {
+                        text(box, hint, SOFT, 12f, 12)
+                        val et = EditText(this)
+                        et.setText(value)
+                        if (numeric) et.inputType = InputType.TYPE_CLASS_NUMBER
+                        et.setTextColor(GREEN)
+                        et.typeface = Typeface.MONOSPACE
+                        et.background = outline(DIM, PANEL, 4)
+                        et.setPadding(dp(12), dp(8), dp(12), dp(8))
+                        box.addView(et, lp(4))
+                        return et
+                    }
+
+                    val nameEt = field(L.t("cmd_name"), old.optString("n", ""), false)
+                    text(box, L.t("cmd_action"), SOFT, 12f, 14)
+                    choices(box, listOf(L.t("cmd_tap"), L.t("cmd_hold")), action, 2) { action = it }
+                    val msEt = field(L.t("cmd_ms"), old.optInt("ms", 600).toString(), true)
+                    text(box, L.t("cmd_when"), SOFT, 12f, 14)
+                    choices(box, listOf(L.t("cmd_t0"), L.t("cmd_t1"), L.t("cmd_t2")), trig, 3) { trig = it }
+                    val everyEt = field(L.t("cmd_every"), old.optInt("s", 30).toString(), true)
+
+                    AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                        .setTitle(if (idx >= 0) L.t("cmd_edit_t") else L.t("cmd_new"))
+                        .setView(sv)
+                        .setPositiveButton(L.t("cmd_save")) { _, _ ->
+                            val o = JSONObject()
+                            val n = nameEt.text.toString().trim()
+                            o.put("n", if (n.isEmpty()) "Cmd" else n)
+                            o.put("x", old.optDouble("x", -1.0))
+                            o.put("y", old.optDouble("y", -1.0))
+                            o.put("a", action)
+                            o.put("ms", (msEt.text.toString().toIntOrNull() ?: 600).coerceIn(60, 10000))
+                            o.put("t", trig)
+                            o.put("s", (everyEt.text.toString().toIntOrNull() ?: 30).coerceAtLeast(1))
+                            o.put("e", old.optInt("e", 1))
+                            val a = cmdArray()
+                            var at = idx
+                            if (idx >= 0) a.put(idx, o) else { a.put(o); at = a.length() - 1 }
+                            saveCmds(a)
+                            showTab(2)
+                            if (idx < 0) calibrate("cmd", at, o.optString("n", ""))
+                        }
+                        .setNegativeButton(L.t("cmd_cancel"), null)
+                        .show()
+                }
+
+                // ---------------------------------------------------------------- onglet REGLAGES
+                private fun tabSettings(): ScrollView {
+                    val (sv, box) = newPage()
+                    text(box, L.t("tab_settings"), GREEN, 22f, 0)
+
+                    val sl = section(box, L.t("sec_lang"))
+                    choices(sl, listOf("Français", "English"), if (L.lang == "en") 1 else 0, 2) { i ->
+                        L.set(this, if (i == 1) "en" else "fr")
+                        showTab(3)
+                    }
+
+                    val sd = section(box, L.t("sec_detect"))
+                    switchRow(sd, "set_method", "ocr", 1)
+                    numField(sd, "set_hpboss", "hpBoss", 10000)
+                    numField(sd, "set_miss", "bossMiss", 4)
+
+                    val sb = section(box, L.t("sec_boss"))
+                    switchRow(sb, "set_fixed", "fixed", 1)
+                    text(sb, L.t("set_dir"), SOFT, 12f, 14)
+                    val dirs = listOf(0, 45, 90, 135, 180, 225, 270, 315)
+                    choices(sb, listOf("→", "↘", "↓", "↙", "←", "↖", "↑", "↗"), maxOf(0, dirs.indexOf(cfg().getInt("dir", 0))), 4) { i ->
+                        cfg().edit().putInt("dir", dirs[i]).apply()
+                    }
+                    val rv = text(sb, L.t("set_radius") + " : " + cfg().getInt("radius", 90), SOFT, 12f, 16)
+                    val seek = SeekBar(this)
+                    seek.max = 280
+                    seek.progress = cfg().getInt("radius", 90) - 20
+                    seek.progressTintList = ColorStateList.valueOf(GREEN)
+                    seek.thumbTintList = ColorStateList.valueOf(GREEN)
+                    seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                        override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                            cfg().edit().putInt("radius", p + 20).apply()
+                            rv.text = L.t("set_radius") + " : " + (p + 20)
+                        }
+                        override fun onStartTrackingTouch(s: SeekBar?) {}
+                        override fun onStopTrackingTouch(s: SeekBar?) {}
+                    })
+                    sb.addView(seek, lp(4))
+                    switchRow(sb, "set_atk", "atkBoss", 0)
+
+                    val sa = section(box, L.t("sec_adv"))
+                    text(sa, L.t("img_info"), SOFT, 12f, 6)
+                    numField(sa, "set_tol", "tolColor", 35)
+                    numField(sa, "set_thrnpc", "thrNpc", 75)
+                    numField(sa, "set_thrboss", "thrBoss", 75)
+                    button(sa, L.t("b_img_npc") + " (" + count("npc_") + ")", GREEN) { pick(PICK_NPC) }
+                    button(sa, L.t("b_img_boss") + " (" + count("boss_") + ")", GREEN) { pick(PICK_BOSS) }
+                    button(sa, L.t("b_clr_npc"), AMBER) { clear("npc_") }
+                    button(sa, L.t("b_clr_boss"), AMBER) { clear("boss_") }
+                    return sv
                 }
 
                 private fun clear(prefix: String) {
                     (filesDir.listFiles() ?: emptyArray()).filter { it.name.startsWith(prefix) }.forEach { it.delete() }
-                    refreshStatus()
-                }
-
-                private fun quitBot() {
-                    val s = Intent(this, BotService::class.java)
-                    s.action = "STOP"
-                    startService(s)
-                    Toast.makeText(this, "Bot arrêté", Toast.LENGTH_SHORT).show()
+                    showTab(3)
                 }
 
                 private fun pick(code: Int) {
@@ -1209,42 +1828,42 @@ jobs:
                     startActivityForResult(i, code)
                 }
 
-                private fun calibrate(mode: String) {
-                    if (!Settings.canDrawOverlays(this)) {
-                        Toast.makeText(this, "Autorisez d'abord l'affichage par-dessus les applis (1a)", Toast.LENGTH_LONG).show()
-                        return
-                    }
+                // ---------------------------------------------------------------- actions
+                private fun quitBot() {
+                    val s = Intent(this, BotService::class.java)
+                    s.action = "STOP"
+                    startService(s)
+                    toast("t_stopped")
+                }
+
+                private fun calibrate(mode: String, index: Int, name: String) {
+                    if (!Settings.canDrawOverlays(this)) { toast("t_overlay"); return }
                     val cs = Intent(this, CalibService::class.java)
                     cs.putExtra("mode", mode)
+                    cs.putExtra("index", index)
+                    cs.putExtra("name", name)
                     startService(cs)
-                    Toast.makeText(this, "Ouvrez WildCraft : le réglage démarre dans 12 secondes", Toast.LENGTH_LONG).show()
+                    toast("t_calib")
                     moveTaskToBack(true)
                 }
 
                 @Suppress("DEPRECATION")
                 private fun testGestures() {
-                    val cfg = getSharedPreferences("cfg", MODE_PRIVATE)
+                    val c = cfg()
                     val acc = BotAccessibility.instance
-                    if (acc == null) {
-                        Toast.makeText(this, "Activez d'abord le service d'accessibilité (1b)", Toast.LENGTH_LONG).show()
-                        return
-                    }
-                    if (!cfg.contains("joyFX") || !cfg.contains("btnFX")) {
-                        Toast.makeText(this, "Placez d'abord le joystick et le bouton d'attaque (3a)", Toast.LENGTH_LONG).show()
-                        return
-                    }
-                    save()
+                    if (acc == null) { toast("t_access"); return }
+                    if (!c.contains("joyFX") || !c.contains("btnFX")) { toast("t_pos"); return }
                     val dm = DisplayMetrics()
                     windowManager.defaultDisplay.getRealMetrics(dm)
-                    val jx = (cfg.getFloat("joyFX", 15f) * dm.widthPixels / 100f).toInt()
-                    val jy = (cfg.getFloat("joyFY", 70f) * dm.heightPixels / 100f).toInt()
-                    val bx = (cfg.getFloat("btnFX", 90f) * dm.widthPixels / 100f).toInt()
-                    val by = (cfg.getFloat("btnFY", 70f) * dm.heightPixels / 100f).toInt()
-                    val r = cfg.getInt("radius", 90)
-                    val rad = Math.toRadians(cfg.getInt("dir", 0).toDouble())
+                    val jx = (c.getFloat("joyFX", 15f) * dm.widthPixels / 100f).toInt()
+                    val jy = (c.getFloat("joyFY", 70f) * dm.heightPixels / 100f).toInt()
+                    val bx = (c.getFloat("btnFX", 90f) * dm.widthPixels / 100f).toInt()
+                    val by = (c.getFloat("btnFY", 70f) * dm.heightPixels / 100f).toInt()
+                    val r = c.getInt("radius", 90)
+                    val rad = Math.toRadians(c.getInt("dir", 0).toDouble())
                     val tx = jx + (r * Math.cos(rad)).toInt()
                     val ty = jy + (r * Math.sin(rad)).toInt()
-                    Toast.makeText(this, "Ouvrez WildCraft : test dans 8 secondes", Toast.LENGTH_LONG).show()
+                    toast("t_test")
                     moveTaskToBack(true)
                     Thread {
                         try {
@@ -1252,42 +1871,23 @@ jobs:
                             acc.tap(bx, by)
                             Thread.sleep(1500)
                             val end = System.currentTimeMillis() + 3000
-                            acc.holdDirection(jx, jy, tx, ty, bx, by, false) { System.currentTimeMillis() < end }
+                            acc.holdDirection(jx, jy, tx, ty, bx, by, false, { emptyList() }) { System.currentTimeMillis() < end }
+                            acc.tap(jx, jy)
                         } catch (e: Exception) {}
                     }.start()
                 }
 
-                private fun save() {
-                    val e = getSharedPreferences("cfg", MODE_PRIVATE).edit()
-                    for ((k, et) in fields) e.putInt(k, et.text.toString().toIntOrNull() ?: defaults[k]!!)
-                    e.apply()
-                }
-
                 private fun start() {
-                    val cfg = getSharedPreferences("cfg", MODE_PRIVATE)
-                    if (!Settings.canDrawOverlays(this)) {
-                        Toast.makeText(this, "Autorisez d'abord l'affichage par-dessus les applis (1a)", Toast.LENGTH_LONG).show()
-                        return
-                    }
-                    if (BotAccessibility.instance == null) {
-                        Toast.makeText(this, "Activez d'abord le service d'accessibilité (1b)", Toast.LENGTH_LONG).show()
-                        return
-                    }
-                    if (!cfg.contains("joyFX") || !cfg.contains("btnFX")) {
-                        Toast.makeText(this, "Placez d'abord le joystick et le bouton d'attaque (3a)", Toast.LENGTH_LONG).show()
-                        return
-                    }
-                    val ocr = (fields["ocr"]?.text?.toString()?.toIntOrNull() ?: 1) == 1
-                    if (ocr) {
-                        if (!cfg.contains("hp1FX") || !cfg.contains("hp2FX")) {
-                            Toast.makeText(this, "Placez d'abord la zone du nombre de vie (3b)", Toast.LENGTH_LONG).show()
-                            return
-                        }
+                    val c = cfg()
+                    if (!Settings.canDrawOverlays(this)) { toast("t_overlay"); return }
+                    if (BotAccessibility.instance == null) { toast("t_access"); return }
+                    if (!c.contains("joyFX") || !c.contains("btnFX")) { toast("t_pos"); return }
+                    if (c.getInt("ocr", 1) == 1) {
+                        if (!c.contains("hp1FX") || !c.contains("hp2FX")) { toast("t_zone"); return }
                     } else if (count("npc_") + count("boss_") == 0) {
-                        Toast.makeText(this, "Ajoutez au moins une image (2a ou 2b)", Toast.LENGTH_LONG).show()
+                        toast("t_images")
                         return
                     }
-                    save()
                     val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
                     startActivityForResult(mpm.createScreenCaptureIntent(), REQ_CAPTURE)
                 }
@@ -1312,15 +1912,96 @@ jobs:
                             }
                             n++
                         }
-                        Toast.makeText(this, n.toString() + " image(s) ajoutée(s)", Toast.LENGTH_SHORT).show()
-                        refreshStatus()
+                        Toast.makeText(this, n.toString() + " " + L.t("t_added"), Toast.LENGTH_SHORT).show()
+                        showTab(3)
                     } else if (requestCode == REQ_CAPTURE) {
                         val s = Intent(this, BotService::class.java)
                         s.putExtra("code", resultCode)
                         s.putExtra("data", data)
                         startForegroundService(s)
-                        Toast.makeText(this, "Ouvrez WildCraft et utilisez le bouton flottant ▶", Toast.LENGTH_LONG).show()
+                        toast("t_open")
                     }
+                }
+            }
+            WCEOF
+            mkdir -p app/src/main/java/com/example/wcbot
+            cat > app/src/main/java/com/example/wcbot/Store.kt <<'WCEOF'
+            package com.example.wcbot
+
+            import android.content.Context
+            import android.content.SharedPreferences
+            import org.json.JSONArray
+
+            /** Profils : chaque profil a son propre fichier de réglages (positions, réglages, commandes). */
+            object Store {
+                private fun app(ctx: Context): SharedPreferences = ctx.getSharedPreferences("app", Context.MODE_PRIVATE)
+
+                fun profiles(ctx: Context): MutableList<String> {
+                    val out = ArrayList<String>()
+                    try {
+                        val arr = JSONArray(app(ctx).getString("profiles", "[\"Solo\",\"Multi\"]"))
+                        for (i in 0 until arr.length()) out.add(arr.getString(i))
+                    } catch (e: Exception) {}
+                    if (out.isEmpty()) { out.add("Solo"); out.add("Multi") }
+                    return out
+                }
+
+                private fun saveProfiles(ctx: Context, list: List<String>) {
+                    val arr = JSONArray()
+                    for (p in list) arr.put(p)
+                    app(ctx).edit().putString("profiles", arr.toString()).apply()
+                }
+
+                fun active(ctx: Context): String {
+                    val a = app(ctx).getString("active", "Solo") ?: "Solo"
+                    val list = profiles(ctx)
+                    return if (list.contains(a)) a else list[0]
+                }
+
+                fun setActive(ctx: Context, name: String) {
+                    app(ctx).edit().putString("active", name).apply()
+                }
+
+                private fun key(name: String): String = name.lowercase().filter { it.isLetterOrDigit() }
+
+                fun exists(ctx: Context, name: String): Boolean = profiles(ctx).any { key(it) == key(name) }
+
+                fun cfgOf(ctx: Context, name: String): SharedPreferences {
+                    val file = if (name == "Solo") "cfg" else "cfg_" + key(name).ifEmpty { "x" }
+                    return ctx.getSharedPreferences(file, Context.MODE_PRIVATE)
+                }
+
+                /** Réglages du profil actif. */
+                fun cfg(ctx: Context): SharedPreferences = cfgOf(ctx, active(ctx))
+
+                fun add(ctx: Context, name: String) {
+                    val list = profiles(ctx)
+                    list.add(name)
+                    saveProfiles(ctx, list)
+                }
+
+                fun delete(ctx: Context, name: String) {
+                    val list = profiles(ctx)
+                    list.remove(name)
+                    cfgOf(ctx, name).edit().clear().apply()
+                    saveProfiles(ctx, list)
+                }
+
+                fun duplicate(ctx: Context, from: String, to: String) {
+                    val src = cfgOf(ctx, from).all
+                    val e = cfgOf(ctx, to).edit()
+                    e.clear()
+                    for ((k, v) in src) {
+                        when (v) {
+                            is Int -> e.putInt(k, v)
+                            is Float -> e.putFloat(k, v)
+                            is Long -> e.putLong(k, v)
+                            is Boolean -> e.putBoolean(k, v)
+                            is String -> e.putString(k, v)
+                        }
+                    }
+                    e.apply()
+                    add(ctx, to)
                 }
             }
             WCEOF
