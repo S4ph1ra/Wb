@@ -41,7 +41,6 @@ jobs:
                 kotlinOptions { jvmTarget = "17" }
             }
             dependencies {
-                implementation("org.opencv:opencv:4.9.0")
                 implementation("com.google.mlkit:text-recognition:16.0.0")
             }
             WCEOF
@@ -123,48 +122,24 @@ jobs:
                     dispatchGesture(g, null, null)
                 }
 
-                /** Appui maintenu pendant durMs millisecondes. */
-                fun hold(x: Int, y: Int, durMs: Long) {
-                    val g = GestureDescription.Builder()
-                        .addStroke(GestureDescription.StrokeDescription(pointPath(x, y), 0, maxOf(60L, durMs)))
-                        .build()
-                    dispatchGesture(g, null, null)
-                }
-
-                private fun addExtras(b: GestureDescription.Builder, extras: List<IntArray>) {
-                    for (e in extras.take(6)) {
-                        b.addStroke(GestureDescription.StrokeDescription(pointPath(e[0], e[1]), 0, maxOf(60L, e[2].toLong())))
-                    }
-                }
-
                 /** Mode joystick LIBRE : glisse de (jx,jy) vers (tx,ty), avec ou sans appui sur le bouton d'attaque. */
-                fun moveAndAttack(
-                    jx: Int, jy: Int, tx: Int, ty: Int, ax: Int, ay: Int,
-                    durMs: Long, attack: Boolean, extras: List<IntArray>
-                ) {
+                fun moveAndAttack(jx: Int, jy: Int, tx: Int, ty: Int, ax: Int, ay: Int, durMs: Long, attack: Boolean) {
                     val joy = Path().apply { moveTo(jx.toFloat(), jy.toFloat()); lineTo(tx.toFloat(), ty.toFloat()) }
-                    val dur = maxOf(durMs, (extras.maxOfOrNull { it[2] } ?: 0).toLong())
                     val b = GestureDescription.Builder()
-                        .addStroke(GestureDescription.StrokeDescription(joy, 0, dur))
+                        .addStroke(GestureDescription.StrokeDescription(joy, 0, durMs))
                     if (attack) b.addStroke(GestureDescription.StrokeDescription(pointPath(ax, ay), 0, 60))
-                    addExtras(b, extras)
                     dispatchGesture(b.build(), null, null)
                 }
 
                 /**
                  * Mode joystick FIXE : pousse le joystick dans une direction et la maintient tant que keep()
-                 * renvoie true. Chaque tranche peut contenir un appui d'attaque et les commandes dues (extras).
+                 * renvoie true. Si attack est vrai, un appui d'attaque est ajouté à chaque tranche.
                  * Un autre geste envoyé pendant ce temps coupe immédiatement le maintien. Bloquant.
                  */
-                fun holdDirection(
-                    jx: Int, jy: Int, tx: Int, ty: Int, ax: Int, ay: Int, attack: Boolean,
-                    extras: () -> List<IntArray>, keep: () -> Boolean
-                ) {
+                fun holdDirection(jx: Int, jy: Int, tx: Int, ty: Int, ax: Int, ay: Int, attack: Boolean, keep: () -> Boolean) {
                     val joyMove = Path().apply { moveTo(jx.toFloat(), jy.toFloat()); lineTo(tx.toFloat(), ty.toFloat()) }
                     val joyHold = Path().apply { moveTo(tx.toFloat(), ty.toFloat()) }
-                    var ex = extras()
-                    var dur = maxOf(300, ex.maxOfOrNull { it[2] } ?: 0).toLong()
-                    var j = GestureDescription.StrokeDescription(joyMove, 0, dur, true)
+                    var j = GestureDescription.StrokeDescription(joyMove, 0, 300, true)
                     var cancelled = false
                     while (true) {
                         val latch = CountDownLatch(1)
@@ -174,7 +149,6 @@ jobs:
                         }
                         val b = GestureDescription.Builder().addStroke(j)
                         if (attack) b.addStroke(GestureDescription.StrokeDescription(pointPath(ax, ay), 0, 60))
-                        addExtras(b, ex)
                         val ok = dispatchGesture(b.build(), cb, null)
                         if (!ok) return
                         latch.await()
@@ -184,9 +158,7 @@ jobs:
                             dispatchGesture(GestureDescription.Builder().addStroke(j).build(), null, null)
                             return
                         }
-                        ex = extras()
-                        dur = maxOf(900, ex.maxOfOrNull { it[2] } ?: 0).toLong()
-                        j = j.continueStroke(joyHold, 0, dur, true)
+                        j = j.continueStroke(joyHold, 0, 900, true)
                     }
                 }
             }
@@ -202,7 +174,6 @@ jobs:
             import android.content.Intent
             import android.content.pm.ServiceInfo
             import android.graphics.Bitmap
-            import android.graphics.BitmapFactory
             import android.graphics.PixelFormat
             import android.graphics.Typeface
             import android.graphics.drawable.GradientDrawable
@@ -223,6 +194,7 @@ jobs:
             import android.view.WindowManager
             import android.widget.Button
             import android.widget.LinearLayout
+            import android.widget.ScrollView
             import android.widget.TextView
             import com.google.android.gms.tasks.Tasks
             import com.google.mlkit.vision.common.InputImage
@@ -230,18 +202,24 @@ jobs:
             import com.google.mlkit.vision.text.TextRecognizer
             import com.google.mlkit.vision.text.latin.TextRecognizerOptions
             import org.json.JSONArray
-            import org.opencv.android.OpenCVLoader
-            import org.opencv.android.Utils
-            import org.opencv.core.Core
-            import org.opencv.core.Mat
-            import org.opencv.core.Scalar
-            import org.opencv.imgproc.Imgproc
-            import java.io.File
             import kotlin.math.abs
             import kotlin.math.cos
             import kotlin.math.sin
 
             class BotService : Service() {
+                companion object {
+                    const val ALIVE = 1
+                    const val MISSING = 0
+                    const val DEAD = -1
+                    const val UNKNOWN = 2
+                    const val GREEN = 0xFF00FF41.toInt()
+                    const val DIM = 0xFF00B34A.toInt()
+                    const val CYAN = 0xFF19D3FF.toInt()
+                    const val AMBER = 0xFFFFB000.toInt()
+                    const val RED = 0xFFFF4D4D.toInt()
+                    const val SOFT = 0xFF9FE8B4.toInt()
+                }
+
                 private var projection: MediaProjection? = null
                 private var reader: ImageReader? = null
                 private var vd: VirtualDisplay? = null
@@ -249,6 +227,8 @@ jobs:
                 private var boxOv: LinearLayout? = null
                 private var lpOv: WindowManager.LayoutParams? = null
                 private var mainBg: GradientDrawable? = null
+                private var panelOv: View? = null
+                private var statusTv: TextView? = null
                 private var wm: WindowManager? = null
                 @Volatile private var running = false
                 @Volatile private var holding = false
@@ -256,28 +236,19 @@ jobs:
                 private var loopThread: Thread? = null
                 private var w = 0
                 private var h = 0
-                companion object {
-                    const val ALIVE = 1
-                    const val MISSING = 0
-                    const val DEAD = -1
-                    const val UNKNOWN = 2
-                }
-
-                private var tplsNpc: List<Mat> = emptyList()
-                private var bossRefs: List<BossRef> = emptyList()
-
-                private class Frame(val rgba: Mat, val gray: Mat, val bmp: Bitmap) {
-                    fun release() { rgba.release(); gray.release() }
-                }
+                private var recognizer: TextRecognizer? = null
+                private var lastRaw = ""
+                private var meMax = 0L
 
                 /** Nombre de vie lu à l'écran : vie actuelle, et vie max si le jeu affiche "actuelle/max". */
                 private class Hp(val cur: Long, val max: Long?)
 
-                private var recognizer: TextRecognizer? = null
-                private var lastRaw = ""
-
-                /** Couleur dominante d'une image de barre de vie + longueur (en pixels) de cette couleur. */
-                private class BossRef(val r: Int, val g: Int, val b: Int, val runLen: Int)
+                /** ScrollView qui ne dépasse pas une hauteur maximale. */
+                private class MaxScroll(ctx: android.content.Context, val maxH: Int) : ScrollView(ctx) {
+                    override fun onMeasure(widthSpec: Int, heightSpec: Int) {
+                        super.onMeasure(widthSpec, View.MeasureSpec.makeMeasureSpec(maxH, View.MeasureSpec.AT_MOST))
+                    }
+                }
 
                 override fun onBind(intent: Intent?): IBinder? = null
 
@@ -289,7 +260,6 @@ jobs:
                     val code = intent?.getIntExtra("code", 0) ?: 0
                     val data = intent?.getParcelableExtra<Intent>("data")
                     if (data == null) { stopSelf(); return START_NOT_STICKY }
-                    OpenCVLoader.initLocal()
                     wm = getSystemService(WINDOW_SERVICE) as WindowManager
                     val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
                     val p = mpm.getMediaProjection(code, data)
@@ -299,8 +269,6 @@ jobs:
                     projection = p
                     setupCapture()
                     recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-                    tplsNpc = loadNpcTemplates()
-                    bossRefs = loadBossRefs()
                     showOverlay()
                     return START_NOT_STICKY
                 }
@@ -309,7 +277,7 @@ jobs:
                     val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
                     nm.createNotificationChannel(NotificationChannel("bot", "Bot", NotificationManager.IMPORTANCE_LOW))
                     val n = Notification.Builder(this, "bot")
-                        .setContentTitle("Bot actif")
+                        .setContentTitle("WCB//NEXUS")
                         .setSmallIcon(android.R.drawable.ic_media_play)
                         .build()
                     if (Build.VERSION.SDK_INT >= 29) {
@@ -332,128 +300,23 @@ jobs:
                     )
                 }
 
-                private fun filesWithPrefix(prefix: String): List<File> =
-                    (filesDir.listFiles() ?: emptyArray()).filter { it.name.startsWith(prefix) }
-
-                private fun loadNpcTemplates(): List<Mat> = filesWithPrefix("npc_").mapNotNull { loadTemplate(it) }
-
-                private fun loadTemplate(f: File): Mat? {
-                    val bmp = BitmapFactory.decodeFile(f.path) ?: return null
-                    val m = Mat()
-                    Utils.bitmapToMat(bmp, m)
-                    val g = Mat()
-                    Imgproc.cvtColor(m, g, Imgproc.COLOR_RGBA2GRAY)
-                    m.release()
-                    return g
-                }
-
-                private fun loadBossRefs(): List<BossRef> = filesWithPrefix("boss_").mapNotNull { bossRefOf(it) }
-
-                /** Cherche la couleur dominante de l'image (la partie colorée de la barre de vie). */
-                private fun bossRefOf(f: File): BossRef? {
-                    val bmp = BitmapFactory.decodeFile(f.path) ?: return null
-                    val wd = bmp.width
-                    val ht = bmp.height
-                    val px = IntArray(wd * ht)
-                    bmp.getPixels(px, 0, wd, 0, 0, wd, ht)
-                    val cnt = IntArray(512)
-                    for (p in px) {
-                        val r = (p shr 16) and 255
-                        val g = (p shr 8) and 255
-                        val b = p and 255
-                        cnt[(r / 32) * 64 + (g / 32) * 8 + (b / 32)]++
-                    }
-                    var best = 0
-                    for (i in 1 until 512) if (cnt[i] > cnt[best]) best = i
-                    var sr = 0L
-                    var sg = 0L
-                    var sb = 0L
-                    var n = 0
-                    for (p in px) {
-                        val r = (p shr 16) and 255
-                        val g = (p shr 8) and 255
-                        val b = p and 255
-                        if ((r / 32) * 64 + (g / 32) * 8 + (b / 32) == best) { sr += r; sg += g; sb += b; n++ }
-                    }
-                    if (n == 0) return null
-                    return BossRef((sr / n).toInt(), (sg / n).toInt(), (sb / n).toInt(), maxOf(6, n / ht))
-                }
-
-                private fun grab(): Frame? {
+                private fun grab(): Bitmap? {
                     val img = reader?.acquireLatestImage() ?: return null
                     try {
                         val pl = img.planes[0]
                         val pad = pl.rowStride - pl.pixelStride * w
                         val wide = Bitmap.createBitmap(w + pad / pl.pixelStride, h, Bitmap.Config.ARGB_8888)
                         wide.copyPixelsFromBuffer(pl.buffer)
-                        val bmp = Bitmap.createBitmap(wide, 0, 0, w, h)
-                        val m = Mat()
-                        Utils.bitmapToMat(bmp, m)
-                        val g = Mat()
-                        Imgproc.cvtColor(m, g, Imgproc.COLOR_RGBA2GRAY)
-                        return Frame(m, g, bmp)
+                        return if (pad == 0) wide else Bitmap.createBitmap(wide, 0, 0, w, h)
                     } finally {
                         img.close()
                     }
                 }
 
-                private fun score(screen: Mat, tpl: Mat): Double {
-                    if (tpl.cols() > screen.cols() || tpl.rows() > screen.rows()) return 0.0
-                    val res = Mat()
-                    Imgproc.matchTemplate(screen, tpl, res, Imgproc.TM_CCOEFF_NORMED)
-                    val best = Core.minMaxLoc(res).maxVal
-                    res.release()
-                    return if (best.isNaN()) 0.0 else best
-                }
-
-                private fun bestScore(screen: Mat, tpls: List<Mat>): Double {
-                    var best = 0.0
-                    for (t in tpls) {
-                        val sc = score(screen, t)
-                        if (sc > best) best = sc
-                    }
-                    return best
-                }
-
-                /** Plus longue ligne horizontale continue de pixels "allumés" dans le masque. */
-                private fun longestRun(mask: Mat): Int {
-                    val wd = mask.cols()
-                    val ht = mask.rows()
-                    val buf = ByteArray(wd * ht)
-                    mask.get(0, 0, buf)
-                    var best = 0
-                    for (y in 0 until ht) {
-                        var run = 0
-                        val off = y * wd
-                        for (x in 0 until wd) {
-                            if (buf[off + x].toInt() != 0) {
-                                run++
-                                if (run > best) best = run
-                            } else {
-                                run = 0
-                            }
-                        }
-                    }
-                    return best
-                }
-
-                /** 0 à 1 : part de la longueur de votre image de barre retrouvée à l'écran, en ligne continue, dans la même couleur. */
-                private fun bossScore(rgba: Mat, tol: Int): Double {
-                    if (bossRefs.isEmpty()) return 0.0
-                    var best = 0.0
-                    val mask = Mat()
-                    for (ref in bossRefs) {
-                        Core.inRange(
-                            rgba,
-                            Scalar((ref.r - tol).toDouble(), (ref.g - tol).toDouble(), (ref.b - tol).toDouble(), 0.0),
-                            Scalar((ref.r + tol).toDouble(), (ref.g + tol).toDouble(), (ref.b + tol).toDouble(), 255.0),
-                            mask
-                        )
-                        val sc = minOf(1.0, longestRun(mask).toDouble() / ref.runLen)
-                        if (sc > best) best = sc
-                    }
-                    mask.release()
-                    return best
+                // ------------------------------------------------------------ lecture des nombres de vie
+                private fun hasZone(p: String): Boolean {
+                    val c = Store.cfg(this)
+                    return c.contains(p + "1FX") && c.contains(p + "2FX")
                 }
 
                 private fun digitsOf(t: String): Long? {
@@ -461,23 +324,23 @@ jobs:
                     return if (d.isEmpty() || d.length > 12) null else d.toLong()
                 }
 
-                /** Lit le nombre de vie dans la zone réglée (reconnaissance de texte sur l'appareil, sans internet). */
-                private fun readHp(f: Frame): Hp? {
+                /** Lit le nombre dans la zone réglée (p = "hp" pour la cible, "me" pour moi). Sans internet. */
+                private fun readZone(bmp: Bitmap, p: String): Hp? {
                     try {
+                        if (!hasZone(p)) return null
                         val cfg = Store.cfg(this)
-                        if (!cfg.contains("hp1FX") || !cfg.contains("hp2FX")) return null
-                        val x1 = (cfg.getFloat("hp1FX", 0f) * w / 100f).toInt().coerceIn(0, w - 2)
-                        val y1 = (cfg.getFloat("hp1FY", 0f) * h / 100f).toInt().coerceIn(0, h - 2)
-                        val x2 = (cfg.getFloat("hp2FX", 0f) * w / 100f).toInt().coerceIn(x1 + 1, w)
-                        val y2 = (cfg.getFloat("hp2FY", 0f) * h / 100f).toInt().coerceIn(y1 + 1, h)
-                        var crop = Bitmap.createBitmap(f.bmp, x1, y1, x2 - x1, y2 - y1)
+                        val x1 = (cfg.getFloat(p + "1FX", 0f) * w / 100f).toInt().coerceIn(0, w - 2)
+                        val y1 = (cfg.getFloat(p + "1FY", 0f) * h / 100f).toInt().coerceIn(0, h - 2)
+                        val x2 = (cfg.getFloat(p + "2FX", 0f) * w / 100f).toInt().coerceIn(x1 + 1, w)
+                        val y2 = (cfg.getFloat(p + "2FY", 0f) * h / 100f).toInt().coerceIn(y1 + 1, h)
+                        var crop = Bitmap.createBitmap(bmp, x1, y1, x2 - x1, y2 - y1)
                         if (crop.height < 64) {
                             val k = minOf(4, (64 + crop.height - 1) / crop.height)
                             crop = Bitmap.createScaledBitmap(crop, crop.width * k, crop.height * k, true)
                         }
                         val rec = recognizer ?: return null
                         val text = Tasks.await(rec.process(InputImage.fromBitmap(crop, 0))).text
-                        lastRaw = text.replace("\n", " ").trim()
+                        if (p == "hp") lastRaw = text.replace("\n", " ").trim()
                         val line = text.lines().firstOrNull { l -> l.any { it.isDigit() || it == 'O' || it == 'o' || it == 'l' || it == 'I' } }
                             ?: return null
                         val fixed = line.replace('O', '0').replace('o', '0').replace('l', '1').replace('I', '1')
@@ -490,13 +353,26 @@ jobs:
                     }
                 }
 
-                private fun fmt(d: Double): String = String.format("%.2f", d)
+                /** Ma vie en % : avec "actuelle/max" si le jeu l'affiche, sinon par rapport au plus grand nombre déjà vu. */
+                private fun selfPct(bmp: Bitmap): Int? {
+                    val hp = readZone(bmp, "me") ?: return null
+                    var max = hp.max ?: 0L
+                    if (max <= 0L) {
+                        if (hp.cur > meMax) meMax = hp.cur
+                        max = meMax
+                    }
+                    if (max <= 0L) return null
+                    return minOf(100L, hp.cur * 100L / max).toInt()
+                }
 
+                // ------------------------------------------------------------ bouton flottant + console
                 private fun setLabel(t: String) {
                     overlay?.post {
                         if (running) {
                             overlay?.text = t
-                            mainBg?.setStroke(3, if (t.contains("BOSS")) 0xFFFFB000.toInt() else 0xFF00FF41.toInt())
+                            statusTv?.text = t
+                            val hot = t.contains("BOSS") || t.contains("MID") || t.contains("LOOT")
+                            mainBg?.setStroke(3, if (hot) AMBER else GREEN)
                         }
                     }
                 }
@@ -518,17 +394,17 @@ jobs:
                     b.minWidth = 0
                     b.minHeight = 0
                     b.setPadding(24, 10, 24, 10)
-                    b.setTextColor(0xFF00FF41.toInt())
-                    b.background = pill(0xFF00FF41.toInt(), 0xCC050A05.toInt())
+                    b.setTextColor(GREEN)
+                    b.background = pill(GREEN, 0xCC050A05.toInt())
                     return b
                 }
 
-                private fun panelLabel(t: String): TextView {
+                private fun panelLabel(t: String, color: Int): TextView {
                     val tv = TextView(this)
                     tv.text = t
                     tv.typeface = Typeface.MONOSPACE
                     tv.textSize = 12f
-                    tv.setTextColor(0xFF19D3FF.toInt())
+                    tv.setTextColor(color)
                     return tv
                 }
 
@@ -543,15 +419,14 @@ jobs:
                     val row = LinearLayout(this)
                     row.orientation = LinearLayout.HORIZONTAL
                     row.gravity = Gravity.CENTER_VERTICAL
-                    val tv = panelLabel(name)
-                    tv.setTextColor(0xFF9FE8B4.toInt())
-                    tv.minWidth = 220
+                    val tv = panelLabel(name, SOFT)
+                    tv.minWidth = 230
                     val value = TextView(this)
                     value.typeface = Typeface.MONOSPACE
                     value.textSize = 13f
-                    value.setTextColor(0xFF00FF41.toInt())
+                    value.setTextColor(GREEN)
                     value.gravity = Gravity.CENTER
-                    value.minWidth = 120
+                    value.minWidth = 130
                     value.text = cfg.getInt(key, def).toString()
                     val minus = smallButton("−")
                     val plus = smallButton("+")
@@ -587,27 +462,79 @@ jobs:
                     return b
                 }
 
-                private fun buildPanel(): LinearLayout {
+                private fun buildPanel(): View {
                     val p = LinearLayout(this)
                     p.orientation = LinearLayout.VERTICAL
                     p.setPadding(24, 18, 24, 18)
+                    p.addView(panelLabel(L.t("o_title"), CYAN))
+                    val st = panelLabel("", SOFT)
+                    st.textSize = 11f
+                    statusTv = st
+                    p.addView(st, topMargin(4))
+                    p.addView(panelLabel(L.t("o_hint"), DIM), topMargin(2))
+
+                    // langue
+                    val langRow = LinearLayout(this)
+                    langRow.orientation = LinearLayout.HORIZONTAL
+                    for (code in listOf("fr", "en")) {
+                        val b = smallButton(code.uppercase())
+                        if (L.lang == code) b.background = pill(GREEN, 0xFF123A18.toInt())
+                        b.setOnClickListener { L.set(this, code); rebuildPanel() }
+                        val l = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                        l.rightMargin = 8
+                        langRow.addView(b, l)
+                    }
+                    p.addView(langRow, topMargin(10))
+
+                    p.addView(panelLabel(L.t("o_threat"), CYAN), topMargin(16))
+                    p.addView(stepper(L.t("o_hp"), "hpBoss", 10000, 5000, 1000, 1000000, false), topMargin(6))
+                    p.addView(stepper(L.t("o_big"), "hpBig", 100000, 10000, 1000, 10000000, false), topMargin(6))
+                    p.addView(stepper(L.t("o_dir"), "dir", 0, 15, 0, 345, true), topMargin(6))
+                    p.addView(stepper(L.t("o_radius"), "radius", 90, 10, 20, 300, false), topMargin(6))
+                    p.addView(toggleRow(L.t("o_atk"), "atkBoss", L.t("o_yes"), L.t("o_no"), 0), topMargin(8))
+                    p.addView(toggleRow(L.t("o_joy"), "fixed", L.t("o_fixed"), L.t("o_free"), 1), topMargin(6))
+
+                    p.addView(panelLabel(L.t("o_vitals"), CYAN), topMargin(16))
+                    p.addView(toggleRow(L.t("o_surv"), "surv", L.t("o_yes"), L.t("o_no"), 0), topMargin(6))
+                    p.addView(stepper(L.t("o_low"), "selfLow", 40, 5, 5, 95, false), topMargin(6))
+                    p.addView(stepper(L.t("o_resume"), "selfResume", 70, 5, 10, 100, false), topMargin(6))
+                    p.addView(stepper(L.t("o_flee"), "dirFlee", 180, 15, 0, 345, true), topMargin(6))
+
+                    p.addView(panelLabel(L.t("o_loot"), CYAN), topMargin(16))
+                    p.addView(toggleRow(L.t("o_lootT"), "loot", L.t("o_yes"), L.t("o_no"), 0), topMargin(6))
+                    val run = smallButton(L.t("o_run"))
+                    run.setOnClickListener {
+                        val g = gen
+                        Thread { try { runLoot(g, true) } catch (e: Exception) {} }.start()
+                    }
+                    p.addView(run, topMargin(8))
+
+                    val q = smallButton(L.t("o_quit"))
+                    q.setTextColor(RED)
+                    q.background = pill(RED, 0xCC050A05.toInt())
+                    q.setOnClickListener { stopSelf() }
+                    p.addView(q, topMargin(16))
+
+                    val sv = MaxScroll(this, (h * 0.6).toInt())
                     val bg = GradientDrawable()
                     bg.setColor(0xEE050A05.toInt())
-                    bg.setStroke(3, 0xFF00FF41.toInt())
+                    bg.setStroke(3, GREEN)
                     bg.cornerRadius = 16f
-                    p.background = bg
-                    p.addView(panelLabel(L.t("o_title")))
-                    p.addView(stepper(L.t("o_dir"), "dir", 0, 15, 0, 345, true), topMargin(12))
-                    p.addView(stepper(L.t("o_hp"), "hpBoss", 10000, 5000, 1000, 1000000, false), topMargin(8))
-                    p.addView(stepper(L.t("o_radius"), "radius", 90, 10, 20, 300, false), topMargin(8))
-                    p.addView(toggleRow(L.t("o_atk"), "atkBoss", L.t("o_yes"), L.t("o_no"), 0), topMargin(12))
-                    p.addView(toggleRow(L.t("o_joy"), "fixed", L.t("o_fixed"), L.t("o_free"), 1), topMargin(8))
-                    val q = smallButton(L.t("o_quit"))
-                    q.setTextColor(0xFFFF4D4D.toInt())
-                    q.background = pill(0xFFFF4D4D.toInt(), 0xCC050A05.toInt())
-                    q.setOnClickListener { stopSelf() }
-                    p.addView(q, topMargin(14))
-                    return p
+                    sv.background = bg
+                    sv.isVerticalScrollBarEnabled = false
+                    sv.addView(p)
+                    return sv
+                }
+
+                private fun rebuildPanel() {
+                    val box = boxOv ?: return
+                    val old = panelOv
+                    val wasVisible = old?.visibility == View.VISIBLE
+                    if (old != null) box.removeView(old)
+                    val np = buildPanel()
+                    np.visibility = if (wasVisible) View.VISIBLE else View.GONE
+                    box.addView(np, topMargin(10))
+                    panelOv = np
                 }
 
                 /** Rend une vue déplaçable au doigt : appui court = onTap, appui long immobile = onLong. */
@@ -669,7 +596,7 @@ jobs:
                     val row = LinearLayout(this)
                     row.orientation = LinearLayout.HORIZONTAL
                     val b = smallButton("▶")
-                    val bg = pill(0xFF00B34A.toInt(), 0xCC050A05.toInt())
+                    val bg = pill(DIM, 0xCC050A05.toInt())
                     b.background = bg
                     mainBg = bg
                     val menu = smallButton("≡")
@@ -678,10 +605,12 @@ jobs:
                     lpMenu.leftMargin = 10
                     row.addView(menu, lpMenu)
                     box.addView(row)
+                    boxOv = box
 
                     val panel = buildPanel()
                     panel.visibility = View.GONE
                     box.addView(panel, topMargin(10))
+                    panelOv = panel
 
                     val lp = WindowManager.LayoutParams(
                         ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -695,10 +624,10 @@ jobs:
                     lpOv = lp
                     drag(b, { toggle() }, { stopSelf() })
                     drag(menu, {
-                        panel.visibility = if (panel.visibility == View.GONE) View.VISIBLE else View.GONE
+                        val pn = panelOv
+                        if (pn != null) pn.visibility = if (pn.visibility == View.GONE) View.VISIBLE else View.GONE
                     }, {})
                     wm!!.addView(box, lp)
-                    boxOv = box
                     overlay = b
                 }
 
@@ -707,13 +636,13 @@ jobs:
                         running = false
                         gen++
                         overlay?.text = "▶"
-                        mainBg?.setStroke(3, 0xFF00B34A.toInt())
+                        mainBg?.setStroke(3, DIM)
                     } else {
                         gen++
                         val g = gen
                         running = true
                         overlay?.text = "■"
-                        val t = Thread { try { if (Store.cfg(this).getInt("ocr", 1) == 1) loopOcr(g) else loopImages(g) } catch (e: Exception) {} }
+                        val t = Thread { try { loop(g) } catch (e: Exception) {} }
                         loopThread = t
                         t.start()
                     }
@@ -721,171 +650,146 @@ jobs:
 
                 private fun active(g: Int): Boolean = running && gen == g
 
-                private class Cmd(val id: String, val x: Float, val y: Float, val hold: Int, val trig: Int, val every: Int)
+                // ------------------------------------------------------------ logique de jeu
+                private fun px(key: String, def: Float, total: Int): Int = (Store.cfg(this).getFloat(key, def) * total / 100f).toInt()
 
-                private val lastRun = HashMap<String, Long>()
-
-                private fun loadCmds(): List<Cmd> {
-                    val out = ArrayList<Cmd>()
-                    try {
-                        val arr = JSONArray(Store.cfg(this).getString("cmds", "[]"))
-                        for (i in 0 until arr.length()) {
-                            val o = arr.getJSONObject(i)
-                            if (o.optInt("e", 1) != 1) continue
-                            val x = o.optDouble("x", -1.0)
-                            val y = o.optDouble("y", -1.0)
-                            if (x < 0 || y < 0) continue
-                            val hold = if (o.optInt("a", 0) == 1) o.optInt("ms", 600) else 0
-                            out.add(Cmd(i.toString() + o.optString("n", ""), x.toFloat(), y.toFloat(), hold, o.optInt("t", 0), maxOf(1, o.optInt("s", 30))))
-                        }
-                    } catch (e: Exception) {}
-                    return out
-                }
-
-                /** Commandes à lancer maintenant. ctx : 0 rien en vue, 1 face à un PNJ, 2 face à un boss. Renvoie [x, y, durée]. */
-                private fun due(ctx: Int): List<IntArray> {
-                    val now = System.currentTimeMillis()
-                    val res = ArrayList<IntArray>()
-                    for (c in loadCmds()) {
-                        if (!(c.trig == 0 || c.trig == ctx)) continue
-                        val last = lastRun[c.id] ?: now
-                        if (lastRun[c.id] == null) lastRun[c.id] = now
-                        if (now - last >= c.every * 1000L) {
-                            lastRun[c.id] = now
-                            res.add(intArrayOf((c.x * w / 100f).toInt(), (c.y * h / 100f).toInt(), c.hold))
-                        }
-                    }
-                    return res
-                }
-
-                /** Lance tout de suite les commandes dues (hors combat de boss). */
-                private fun runDue(ctx: Int) {
-                    val acc = BotAccessibility.instance ?: return
-                    for (e in due(ctx)) {
-                        if (e[2] > 0) {
-                            acc.hold(e[0], e[1], e[2].toLong())
-                            Thread.sleep(e[2].toLong() + 80)
-                        } else {
-                            acc.tap(e[0], e[1])
-                            Thread.sleep(150)
-                        }
-                    }
-                }
-
-                /** Méthode 1 : lecture du nombre de vie. Au-dessus du seuil = boss, en dessous = PNJ. */
-                private fun loopOcr(g: Int) {
+                private fun loop(g: Int) {
                     val cfg = Store.cfg(this)
-                    val btnX = (cfg.getFloat("btnFX", 90f) * w / 100f).toInt()
-                    val btnY = (cfg.getFloat("btnFY", 70f) * h / 100f).toInt()
+                    val btnX = px("btnFX", 90f, w)
+                    val btnY = px("btnFY", 70f, h)
                     var lastPet = 0L
                     var noImage = 0
+                    meMax = 0L
                     while (active(g)) {
-                        val f = grab()
-                        if (f == null) {
+                        val bmp = grab()
+                        if (bmp == null) {
                             noImage++
                             if (noImage == 10) setLabel("■ " + L.t("o_noimg"))
                             Thread.sleep(200)
                             continue
                         }
                         noImage = 0
-                        val hp = readHp(f)
-                        f.release()
+                        val hp = readZone(bmp, "hp")
                         if (hp == null) {
                             setLabel("■ " + L.t("o_nonum") + " (" + lastRaw.take(14) + ")")
-                            runDue(0)
                             Thread.sleep(300)
                             continue
                         }
-                        val hpBoss = cfg.getInt("hpBoss", 10000).toLong()
+                        val bossMin = cfg.getInt("hpBoss", 10000).toLong()
+                        val big = cfg.getInt("hpBig", 100000).toLong()
+                        val surv = cfg.getInt("surv", 0) == 1 && hasZone("me")
                         val ref = hp.max ?: hp.cur
+                        val kind = if (ref < bossMin) L.t("o_npc") else if (surv && ref < big) "MID" else "BOSS"
                         val acc = if (BotAccessibility.instance == null) " | " + L.t("o_accoff") else ""
-                        val kind = if (ref >= hpBoss) "BOSS" else "PNJ"
                         setLabel("■ " + L.t("o_life") + " " + hp.cur + (if (hp.max != null) "/" + hp.max else "") + " → " + kind + acc)
                         if (hp.cur > 0) {
-                            if (ref >= hpBoss) {
-                                circleBoss(g) {
-                                    val f2 = grab()
-                                    if (f2 == null) {
-                                        UNKNOWN
-                                    } else {
-                                        val h2 = readHp(f2)
-                                        f2.release()
-                                        setLabel("■ BOSS " + L.t("o_life") + " " + (if (h2 != null) h2.cur.toString() else "?"))
-                                        if (h2 == null) MISSING else if (h2.cur <= 0) DEAD else ALIVE
-                                    }
-                                }
-                            } else {
+                            if (ref < bossMin) {
                                 if (System.currentTimeMillis() - lastPet > 2000) {
                                     BotAccessibility.instance?.tap(btnX, btnY)
                                     lastPet = System.currentTimeMillis()
                                 }
-                                runDue(1)
-                            }
-                        } else {
-                            runDue(0)
-                        }
-                        Thread.sleep(300)
-                    }
-                }
-
-                /** Méthode 0 : reconnaissance par images (PNJ) et par couleur de barre (boss). */
-                private fun loopImages(g: Int) {
-                    val cfg = Store.cfg(this)
-                    val btnX = (cfg.getFloat("btnFX", 90f) * w / 100f).toInt()
-                    val btnY = (cfg.getFloat("btnFY", 70f) * h / 100f).toInt()
-                    val thrNpc = cfg.getInt("thrNpc", 75) / 100.0
-                    val thrBoss = cfg.getInt("thrBoss", 75) / 100.0
-                    val tol = cfg.getInt("tolColor", 35)
-                    var lastPet = 0L
-                    var noImage = 0
-                    while (active(g)) {
-                        val f = grab()
-                        if (f == null) {
-                            noImage++
-                            if (noImage == 10) setLabel("■ " + L.t("o_noimg"))
-                            Thread.sleep(200)
-                            continue
-                        }
-                        noImage = 0
-                        val sNpc = bestScore(f.gray, tplsNpc)
-                        val sBoss = bossScore(f.rgba, tol)
-                        f.release()
-                        val boss = sBoss >= thrBoss
-                        val npc = !boss && sNpc >= thrNpc
-                        val acc = if (BotAccessibility.instance == null) " | " + L.t("o_accoff") else ""
-                        setLabel("■ PNJ " + fmt(sNpc) + "/" + fmt(thrNpc) + " | Boss " + fmt(sBoss) + "/" + fmt(thrBoss) + acc)
-                        if (boss) {
-                            circleBoss(g) {
-                                val f2 = grab()
-                                if (f2 == null) {
-                                    UNKNOWN
-                                } else {
-                                    val sb = bossScore(f2.rgba, tol)
-                                    f2.release()
-                                    setLabel("■ BOSS " + fmt(sb) + "/" + fmt(thrBoss))
-                                    if (sb >= thrBoss) ALIVE else MISSING
+                            } else if (surv && ref < big) {
+                                if (fightSmall(g)) runLoot(g, false)
+                            } else {
+                                val killed = circleBoss(g) {
+                                    val b2 = grab()
+                                    if (b2 == null) {
+                                        UNKNOWN
+                                    } else {
+                                        val h2 = readZone(b2, "hp")
+                                        setLabel("■ BOSS " + L.t("o_life") + " " + (if (h2 != null) h2.cur.toString() else "?"))
+                                        if (h2 == null) MISSING else if (h2.cur <= 0) DEAD else ALIVE
+                                    }
                                 }
+                                if (killed) runLoot(g, false)
                             }
-                        } else if (npc) {
-                            if (System.currentTimeMillis() - lastPet > 2000) {
-                                BotAccessibility.instance?.tap(btnX, btnY)
-                                lastPet = System.currentTimeMillis()
-                            }
-                            runDue(1)
-                        } else {
-                            runDue(0)
                         }
                         Thread.sleep(300)
                     }
                 }
 
-                /** Tourne autour du boss tant que alive() ne dit pas que le boss est fini. */
-                private fun circleBoss(g: Int, alive: () -> Int) {
+                /** Petit boss : l'animal attaque ; si MA vie passe sous le seuil, mon perso bouge jusqu'à ce qu'elle remonte. */
+                private fun fightSmall(g: Int): Boolean {
                     val cfg = Store.cfg(this)
-                    val jx = (cfg.getFloat("joyFX", 15f) * w / 100f).toInt()
-                    val jy = (cfg.getFloat("joyFY", 70f) * h / 100f).toInt()
-                    val ax = (cfg.getFloat("btnFX", 90f) * w / 100f).toInt()
-                    val ay = (cfg.getFloat("btnFY", 70f) * h / 100f).toInt()
+                    val jx = px("joyFX", 15f, w)
+                    val jy = px("joyFY", 70f, h)
+                    val btnX = px("btnFX", 90f, w)
+                    val btnY = px("btnFY", 70f, h)
+                    val r = cfg.getInt("radius", 90)
+                    val rad = Math.toRadians(cfg.getInt("dirFlee", 180).toDouble())
+                    val tx = jx + (r * cos(rad)).toInt()
+                    val ty = jy + (r * sin(rad)).toInt()
+                    val low = cfg.getInt("selfLow", 40)
+                    val resume = cfg.getInt("selfResume", 70)
+                    val maxMiss = cfg.getInt("bossMiss", 4)
+                    var fleeing = false
+                    var fleeThread: Thread? = null
+                    var missing = 0
+                    var dead = 0
+                    var lastPet = 0L
+                    var killed = false
+
+                    fun startFlee() {
+                        if (fleeing) return
+                        fleeing = true
+                        holding = true
+                        val t = Thread {
+                            try {
+                                BotAccessibility.instance?.holdDirection(jx, jy, tx, ty, 0, 0, false) { holding && active(g) }
+                            } catch (e: Exception) {}
+                        }
+                        fleeThread = t
+                        t.start()
+                    }
+
+                    fun stopFlee() {
+                        if (!fleeing) return
+                        fleeing = false
+                        holding = false
+                        BotAccessibility.instance?.tap(jx, jy)
+                        try { fleeThread?.join(3000) } catch (e: Exception) {}
+                        fleeThread = null
+                    }
+
+                    while (active(g) && missing < maxMiss) {
+                        val bmp = grab()
+                        if (bmp != null) {
+                            val t = readZone(bmp, "hp")
+                            val me = selfPct(bmp)
+                            if (t == null) {
+                                missing++
+                            } else if (t.cur <= 0) {
+                                dead++
+                                if (dead >= 2) { killed = true; break }
+                            } else {
+                                missing = 0
+                                dead = 0
+                            }
+                            if (me != null) {
+                                if (!fleeing && me < low) startFlee()
+                                else if (fleeing && me >= resume) stopFlee()
+                            }
+                            val tv = if (t != null) t.cur.toString() else "?"
+                            val mv = if (me != null) me.toString() else "?"
+                            setLabel("■ MID " + L.t("o_life") + " " + tv + " | " + L.t("o_me") + " " + mv + "%" + (if (fleeing) " ▶▶" else ""))
+                        }
+                        if (!fleeing && System.currentTimeMillis() - lastPet > 2000) {
+                            BotAccessibility.instance?.tap(btnX, btnY)
+                            lastPet = System.currentTimeMillis()
+                        }
+                        Thread.sleep(300)
+                    }
+                    stopFlee()
+                    return killed
+                }
+
+                /** Gros boss : tourne autour tant que alive() ne dit pas que le boss est fini. Renvoie true s'il est mort. */
+                private fun circleBoss(g: Int, alive: () -> Int): Boolean {
+                    val cfg = Store.cfg(this)
+                    val jx = px("joyFX", 15f, w)
+                    val jy = px("joyFY", 70f, h)
+                    val ax = px("btnFX", 90f, w)
+                    val ay = px("btnFY", 70f, h)
                     val r = cfg.getInt("radius", 90)
                     val fixed = cfg.getInt("fixed", 1) == 1
                     val maxMiss = cfg.getInt("bossMiss", 4)
@@ -900,7 +804,7 @@ jobs:
                         holding = true
                         val t = Thread {
                             try {
-                                BotAccessibility.instance?.holdDirection(jx, jy, tx, ty, ax, ay, attack, { due(2) }) { holding && active(g) }
+                                BotAccessibility.instance?.holdDirection(jx, jy, tx, ty, ax, ay, attack) { holding && active(g) }
                             } catch (e: Exception) {}
                         }
                         t.start()
@@ -914,8 +818,8 @@ jobs:
                         holding = false
                         // un nouveau geste coupe aussitôt le maintien : le joystick est relâché tout de suite
                         BotAccessibility.instance?.tap(jx, jy)
-                        t.join(3000)
-                        return
+                        try { t.join(3000) } catch (e: Exception) {}
+                        return dead >= 2
                     }
 
                     var angle = 0.0
@@ -924,12 +828,35 @@ jobs:
                         val rad = Math.toRadians(angle)
                         val tx = jx + (r * cos(rad)).toInt()
                         val ty = jy + (r * sin(rad)).toInt()
-                        BotAccessibility.instance?.moveAndAttack(jx, jy, tx, ty, ax, ay, 300, attack, due(2))
+                        BotAccessibility.instance?.moveAndAttack(jx, jy, tx, ty, ax, ay, 300, attack)
                         Thread.sleep(340)
                         val a = alive()
                         if (a == ALIVE) { missing = 0; dead = 0 }
                         else if (a == MISSING) missing++
                         else if (a == DEAD) { dead++; if (dead >= 2) missing = maxMiss }
+                    }
+                    return dead >= 2
+                }
+
+                /** Après la mort d'un boss : rejoue la séquence d'appuis enregistrée (ouvrir les coffres). */
+                private fun runLoot(g: Int, force: Boolean) {
+                    val cfg = Store.cfg(this)
+                    if (!force && cfg.getInt("loot", 0) != 1) return
+                    val acc = BotAccessibility.instance ?: return
+                    val pts = try { JSONArray(cfg.getString("lootPts", "[]")) } catch (e: Exception) { JSONArray() }
+                    if (pts.length() == 0) return
+                    val first = if (force) 500L else cfg.getInt("lootStart", 2000).toLong()
+                    val delay = cfg.getInt("lootDelay", 800).toLong()
+                    val repeat = cfg.getInt("lootRepeat", 1).coerceIn(1, 30)
+                    setLabel("■ " + L.t("o_loot_run"))
+                    Thread.sleep(first)
+                    for (r in 0 until repeat) {
+                        for (i in 0 until pts.length()) {
+                            if (!force && !active(g)) return
+                            val p = pts.getJSONArray(i)
+                            acc.tap((p.getDouble(0) * w / 100.0).toInt(), (p.getDouble(1) * h / 100.0).toInt())
+                            Thread.sleep(delay)
+                        }
                     }
                 }
 
@@ -979,47 +906,23 @@ jobs:
                 private var keys: List<String> = emptyList()
                 private var done = ""
                 private var mode = "buttons"
-                private var cmdIndex = -1
                 private var step = 0
+                private var lootPts = JSONArray()
 
                 override fun onBind(intent: Intent?): IBinder? = null
 
                 override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
                     L.init(this)
                     mode = intent?.getStringExtra("mode") ?: "buttons"
-                    cmdIndex = intent?.getIntExtra("index", -1) ?: -1
-                    if (mode == "zone") {
-                        steps = listOf(L.t("c_z1"), L.t("c_z2"))
-                        keys = listOf("hp1", "hp2")
-                        done = L.t("c_done_zone")
-                    } else if (mode == "cmd") {
-                        val name = intent?.getStringExtra("name") ?: ""
-                        steps = listOf(L.t("cmd_pos_step") + " « " + name + " »")
-                        keys = listOf("cmd")
-                        done = L.t("cmd_pos_ok")
-                    } else {
-                        steps = listOf(L.t("c_joy"), L.t("c_btn"))
-                        keys = listOf("joy", "btn")
-                        done = L.t("c_done_btn")
+                    when (mode) {
+                        "zone" -> { steps = listOf(L.t("c_z1"), L.t("c_z2")); keys = listOf("hp1", "hp2"); done = L.t("c_done_zone") }
+                        "self" -> { steps = listOf(L.t("c_s1"), L.t("c_s2")); keys = listOf("me1", "me2"); done = L.t("c_done_zone") }
+                        "loot" -> { steps = listOf(L.t("c_loot_n") + "1"); keys = listOf("loot"); done = L.t("c_done_loot") }
+                        else -> { steps = listOf(L.t("c_joy"), L.t("c_btn")); keys = listOf("joy", "btn"); done = L.t("c_done_btn") }
                     }
                     step = 0
                     handler.postDelayed({ show() }, 12000)
                     return START_NOT_STICKY
-                }
-
-                private fun saveTouch(xPct: Float, yPct: Float) {
-                    val cfg = Store.cfg(this)
-                    if (mode == "cmd") {
-                        try {
-                            val arr = JSONArray(cfg.getString("cmds", "[]"))
-                            val o = arr.getJSONObject(cmdIndex)
-                            o.put("x", xPct.toDouble())
-                            o.put("y", yPct.toDouble())
-                            cfg.edit().putString("cmds", arr.toString()).apply()
-                        } catch (e: Exception) {}
-                    } else {
-                        cfg.edit().putFloat(keys[step] + "FX", xPct).putFloat(keys[step] + "FY", yPct).apply()
-                    }
                 }
 
                 @Suppress("DEPRECATION")
@@ -1030,6 +933,11 @@ jobs:
                     manager.defaultDisplay.getRealMetrics(dm)
                     val sw = dm.widthPixels.toFloat()
                     val sh = dm.heightPixels.toFloat()
+                    val cfg = Store.cfg(this)
+                    if (mode == "loot") {
+                        lootPts = JSONArray()
+                        cfg.edit().putString("lootPts", "[]").apply()
+                    }
 
                     val frame = FrameLayout(this)
                     frame.setBackgroundColor(0xCC000000.toInt())
@@ -1052,19 +960,43 @@ jobs:
                         cancel,
                         FrameLayout.LayoutParams(
                             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-                            Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+                            Gravity.BOTTOM or Gravity.START
                         )
                     )
+                    if (mode == "loot") {
+                        val fin = Button(this)
+                        fin.text = L.t("c_loot_done")
+                        fin.setOnClickListener {
+                            Toast.makeText(this, L.t("c_done_loot") + " (" + lootPts.length() + ")", Toast.LENGTH_LONG).show()
+                            stopSelf()
+                        }
+                        frame.addView(
+                            fin,
+                            FrameLayout.LayoutParams(
+                                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                                Gravity.BOTTOM or Gravity.END
+                            )
+                        )
+                    }
 
                     frame.setOnTouchListener { _, ev ->
                         if (ev.action == MotionEvent.ACTION_DOWN) {
-                            saveTouch(ev.rawX / sw * 100f, ev.rawY / sh * 100f)
-                            step++
-                            if (step >= steps.size) {
-                                Toast.makeText(this, done, Toast.LENGTH_LONG).show()
-                                stopSelf()
+                            val xp = ev.rawX / sw * 100f
+                            val yp = ev.rawY / sh * 100f
+                            if (mode == "loot") {
+                                lootPts.put(JSONArray().put(xp.toDouble()).put(yp.toDouble()))
+                                cfg.edit().putString("lootPts", lootPts.toString()).apply()
+                                step++
+                                label.text = L.t("c_loot_n") + (step + 1)
                             } else {
-                                label.text = steps[step]
+                                cfg.edit().putFloat(keys[step] + "FX", xp).putFloat(keys[step] + "FY", yp).apply()
+                                step++
+                                if (step >= steps.size) {
+                                    Toast.makeText(this, done, Toast.LENGTH_LONG).show()
+                                    stopSelf()
+                                } else {
+                                    label.text = steps[step]
+                                }
                             }
                         }
                         true
@@ -1114,139 +1046,151 @@ jobs:
                 fun t(k: String): String = (if (lang == "en") en[k] else fr[k]) ?: fr[k] ?: k
 
                 private val fr = mapOf(
-                    "tab_home" to "ACCUEIL", "tab_profiles" to "PROFILS", "tab_commands" to "COMMANDES", "tab_settings" to "RÉGLAGES",
-                    "prompt" to "root@tablette:~$ ./wildcraft_bot --ready",
-                    "active_profile" to "Profil actif",
-                    "st_pos" to "positions", "st_zone" to "zone de vie", "st_acc" to "accessibilité", "st_img" to "images PNJ / BOSS",
-                    "to_3a" to "à placer (3a)", "to_3b" to "à placer (3b)", "off_1b" to "OFF (1b)",
-                    "sec_perm" to "AUTORISATIONS", "sec_pos" to "POSITIONS", "sec_launch" to "LANCEMENT",
-                    "b_overlay" to "1a. Autoriser l'affichage par-dessus les applis",
-                    "b_access" to "1b. Activer le service d'accessibilité",
-                    "b_3a" to "3a. Placer le joystick et le bouton d'attaque",
-                    "b_3b" to "3b. Placer la zone du nombre de vie (ciblez un monstre avant)",
-                    "b_test" to "Test des gestes (dans 8 s : appui attaque, puis joystick tenu 3 s)",
-                    "b_start" to "DÉMARRER  (puis ouvrez WildCraft)",
-                    "b_quit" to "[ QUITTER LE BOT ]",
-                    "tip_play" to "En jeu : le bouton flottant se déplace au doigt, ≡ ouvre les réglages rapides, et un appui long dessus quitte le bot.",
+                    "tab_home" to "CORE", "tab_profiles" to "MATRIX", "tab_modules" to "MODULES", "tab_settings" to "SYS",
+                    "banner" to "▌WCB//NEXUS   build 0x2F4A   kernel r7",
+                    "prompt" to "root@neuro-link:~# ./wcb --init --mode=ocr",
+                    "st_matrix" to "MATRIX.ACTIVE", "st_pos" to "INPUT.MAP", "st_zt" to "VISION.T", "st_zs" to "VISION.S",
+                    "st_acc" to "RELAY", "st_loot" to "LOOT.SEQ",
+                    "unset" to "non défini", "steps" to "étape(s)",
+                    "sec_perm" to "[0x01] ACCESS.GRANT", "hint_perm" to "# autorisations système",
+                    "sec_pos" to "[0x02] INPUT.MAPPING", "hint_pos" to "# 3a joystick + attaque · 3b zone vie cible · 3c zone de ma vie",
+                    "sec_launch" to "[0x03] EXEC.CORE", "hint_launch" to "# lancement du bot",
+                    "b_overlay" to "1a · OVERLAY.AUTH", "b_access" to "1b · RELAY.ENABLE",
+                    "b_3a" to "3a · INPUT.MAP", "b_3b" to "3b · VISION.ZONE.T", "b_3c" to "3c · VISION.ZONE.S",
+                    "b_test" to "SELF.TEST · gestes (dans 8 s)",
+                    "b_start" to "EXEC · START", "b_quit" to "ABORT · KILL.PROC",
+                    "tip_play" to "# en jeu : glissez le bouton flottant · ≡ ouvre la console · appui long = KILL",
                     "t_overlay" to "Autorisez d'abord l'affichage par-dessus les applis (1a)",
                     "t_access" to "Activez d'abord le service d'accessibilité (1b)",
                     "t_pos" to "Placez d'abord le joystick et le bouton d'attaque (3a)",
-                    "t_zone" to "Placez d'abord la zone du nombre de vie (3b)",
-                    "t_images" to "Ajoutez au moins une image (Réglages, détection par images)",
+                    "t_zone" to "Placez d'abord la zone du nombre de vie de la cible (3b)",
                     "t_stopped" to "Bot arrêté",
                     "t_calib" to "Ouvrez WildCraft : le réglage démarre dans 12 secondes",
                     "t_test" to "Ouvrez WildCraft : test dans 8 secondes",
-                    "t_added" to "image(s) ajoutée(s)",
                     "t_open" to "Ouvrez WildCraft et utilisez le bouton flottant ▶",
-                    "prof_hint" to "Chaque profil garde ses propres positions, réglages et commandes (ex : Solo, Multi).",
-                    "sec_profiles" to "PROFILS ENREGISTRÉS", "prof_active" to "actif", "prof_new" to "NOUVEAU PROFIL",
-                    "prof_name" to "Nom du profil", "prof_create" to "Créer le profil", "prof_dup" to "Dupliquer le profil actif",
+                    "t_noseq" to "Aucune séquence enregistrée (MODULES, LOOT.PROTOCOL)",
+                    "sec_profiles" to "[0x10] MATRIX.SLOTS", "hint_profiles" to "# chaque profil garde ses positions et réglages (ex : Solo, Multi)",
+                    "prof_active" to "actif", "prof_new" to "[0x11] MATRIX.NEW",
+                    "prof_name" to "ID du profil", "prof_create" to "SLOT.CREATE", "prof_dup" to "SLOT.CLONE",
                     "prof_exists" to "Ce nom existe déjà", "prof_empty" to "Donnez un nom au profil",
-                    "prof_del_q" to "Supprimer ce profil et ses commandes ?", "yes" to "Oui", "no" to "Non",
-                    "cmd_hint" to "Une commande appuie toute seule sur un point de l'écran de jeu. Elle est propre au profil actif.",
-                    "sec_cmds" to "COMMANDES", "cmd_add" to "+ Ajouter une commande", "cmd_none" to "Aucune commande pour ce profil.",
-                    "cmd_name" to "Nom (ex : Manger)", "cmd_action" to "Action", "cmd_tap" to "Appui", "cmd_hold" to "Maintien",
-                    "cmd_ms" to "Durée du maintien (ms)", "cmd_when" to "Quand",
-                    "cmd_t0" to "Toujours", "cmd_t1" to "Face à un PNJ", "cmd_t2" to "Face à un boss",
-                    "cmd_every" to "Toutes les (secondes)", "cmd_save" to "Enregistrer", "cmd_cancel" to "Annuler",
-                    "cmd_edit" to "Modifier", "cmd_place" to "Placer", "cmd_del" to "Supprimer",
-                    "cmd_unplaced" to "position non placée", "cmd_placed" to "position OK",
-                    "cmd_new" to "Nouvelle commande", "cmd_edit_t" to "Modifier la commande",
-                    "cmd_pos_step" to "Touchez l'endroit du bouton", "cmd_pos_ok" to "Position enregistrée ✔",
-                    "s_tap" to "appui", "s_hold" to "maintien", "s_every" to "toutes les",
-                    "sec_lang" to "LANGUE", "sec_detect" to "DÉTECTION", "sec_boss" to "COMBAT DE BOSS", "sec_adv" to "AVANCÉ : DÉTECTION PAR IMAGES",
-                    "set_method" to "Lire le nombre de vie (désactivé = détection par images)",
+                    "prof_del_q" to "Supprimer ce profil ?", "yes" to "Oui", "no" to "Non",
+                    "sec_vitals" to "[0x20] VITALS.GUARD",
+                    "hint_vitals" to "# petits boss : si MA vie passe sous le seuil, mon perso bouge. Gros boss : tour en cercle comme avant",
+                    "mod_surv" to "VITALS.GUARD actif",
+                    "set_big" to "Gros boss à partir de (vie)",
+                    "set_low" to "Bouger quand ma vie passe sous (%)",
+                    "set_resume" to "Reprendre quand elle remonte à (%)",
+                    "set_flee" to "Direction de fuite",
+                    "sec_loot" to "[0x30] LOOT.PROTOCOL",
+                    "hint_loot" to "# après la mort d'un boss : rejoue vos appuis (menu, bouton, bouton...)",
+                    "mod_loot" to "LOOT.PROTOCOL actif",
+                    "b_seq_rec" to "SEQ.RECORD · placer les boutons",
+                    "b_seq_test" to "SEQ.RUN · test (dans 8 s)",
+                    "set_lstart" to "Attente après la mort du boss (ms)",
+                    "set_ldelay" to "Pause entre deux appuis (ms)",
+                    "set_lrepeat" to "Répéter la séquence (fois)",
+                    "sec_lang" to "[0x40] LOCALE", "sec_detect" to "[0x41] VISION.OCR", "sec_boss" to "[0x42] THREAT.ENGINE",
+                    "hint_detect" to "# lecture du nombre de vie de la cible",
+                    "hint_boss" to "# comportement face aux boss",
                     "set_hpboss" to "Vie à partir de laquelle c'est un BOSS (ex : 10000)",
                     "set_miss" to "Lectures ratées avant la fin du boss (1 = environ 0,3 s)",
                     "set_fixed" to "Joystick en mode fixe (désactivé = libre)",
-                    "set_dir" to "Direction tenue autour du boss",
+                    "set_dir" to "Direction tenue autour du gros boss",
                     "set_radius" to "Amplitude du joystick",
                     "set_atk" to "Taper sur l'attaque pendant le boss",
-                    "set_tol" to "Boss : tolérance de couleur de la barre",
-                    "set_thrnpc" to "PNJ : sensibilité (%)",
-                    "set_thrboss" to "Boss : part de la barre à retrouver (%)",
-                    "img_info" to "PNJ : images rognées du PNJ (nom ou icône). BOSS : partie colorée de la barre de vie, sans bord ni fond.",
-                    "b_img_npc" to "PNJ : ajouter des images", "b_img_boss" to "BOSS : ajouter des images de barre de vie",
-                    "b_clr_npc" to "Effacer les images de PNJ", "b_clr_boss" to "Effacer les images de boss",
                     "c_joy" to "Touchez le CENTRE du joystick de déplacement",
                     "c_btn" to "Touchez le bouton d'ATTAQUE",
-                    "c_z1" to "Touchez le coin HAUT-GAUCHE de la zone du nombre de vie",
-                    "c_z2" to "Touchez le coin BAS-DROIT de cette zone (autour du nombre seulement)",
-                    "c_done_btn" to "Positions enregistrées ✔", "c_done_zone" to "Zone du nombre de vie enregistrée ✔",
+                    "c_z1" to "CIBLE : touchez le coin HAUT-GAUCHE de la zone du nombre de vie",
+                    "c_z2" to "CIBLE : touchez le coin BAS-DROIT (autour du nombre seulement)",
+                    "c_s1" to "MA VIE : touchez le coin HAUT-GAUCHE de la zone du nombre",
+                    "c_s2" to "MA VIE : touchez le coin BAS-DROIT (autour du nombre seulement)",
+                    "c_loot_n" to "Touchez le bouton n° ",
+                    "c_loot_done" to "Terminé",
+                    "c_done_btn" to "Positions enregistrées ✔", "c_done_zone" to "Zone enregistrée ✔", "c_done_loot" to "Séquence enregistrée ✔",
                     "c_cancel" to "Annuler",
-                    "o_title" to "// RÉGLAGES EN JEU (effet au prochain boss)",
-                    "o_dir" to "Direction (°)", "o_hp" to "Boss si vie ≥", "o_radius" to "Amplitude joystick",
-                    "o_atk" to "Attaque pendant boss", "o_yes" to "OUI", "o_no" to "NON",
-                    "o_joy" to "Joystick", "o_fixed" to "FIXE", "o_free" to "LIBRE", "o_quit" to "[ QUITTER LE BOT ]",
-                    "o_noimg" to "pas d'image reçue", "o_nonum" to "aucun nombre lu", "o_accoff" to "ACCESSIBILITÉ OFF", "o_life" to "vie"
+                    "o_title" to "// CTRL.PANEL", "o_threat" to "// THREAT.ENGINE", "o_vitals" to "// VITALS.GUARD", "o_loot" to "// LOOT.PROTOCOL",
+                    "o_hint" to "# effet au prochain combat",
+                    "o_dir" to "Direction (°)", "o_hp" to "Boss si vie ≥", "o_big" to "Gros boss ≥", "o_radius" to "Amplitude joystick",
+                    "o_atk" to "Attaque pendant boss", "o_joy" to "Joystick", "o_fixed" to "FIXE", "o_free" to "LIBRE",
+                    "o_surv" to "Survie", "o_low" to "Bouger sous (%)", "o_resume" to "Reprise (%)", "o_flee" to "Fuite (°)",
+                    "o_lootT" to "Loot auto", "o_run" to "▸ SEQ.RUN maintenant",
+                    "o_yes" to "OUI", "o_no" to "NON", "o_quit" to "[ KILL.PROC ]",
+                    "o_noimg" to "pas d'image reçue", "o_nonum" to "aucun nombre lu", "o_accoff" to "RELAIS OFF",
+                    "o_life" to "vie", "o_me" to "moi", "o_npc" to "PNJ", "o_loot_run" to "LOOT en cours"
                 )
 
                 private val en = mapOf(
-                    "tab_home" to "HOME", "tab_profiles" to "PROFILES", "tab_commands" to "COMMANDS", "tab_settings" to "SETTINGS",
-                    "prompt" to "root@tablet:~$ ./wildcraft_bot --ready",
-                    "active_profile" to "Active profile",
-                    "st_pos" to "controls", "st_zone" to "HP zone", "st_acc" to "accessibility", "st_img" to "NPC / BOSS images",
-                    "to_3a" to "to place (3a)", "to_3b" to "to place (3b)", "off_1b" to "OFF (1b)",
-                    "sec_perm" to "PERMISSIONS", "sec_pos" to "POSITIONS", "sec_launch" to "LAUNCH",
-                    "b_overlay" to "1a. Allow display over other apps",
-                    "b_access" to "1b. Enable the accessibility service",
-                    "b_3a" to "3a. Place the joystick and the attack button",
-                    "b_3b" to "3b. Place the HP number zone (target a monster first)",
-                    "b_test" to "Gesture test (in 8 s: attack tap, then joystick held 3 s)",
-                    "b_start" to "START  (then open WildCraft)",
-                    "b_quit" to "[ QUIT THE BOT ]",
-                    "tip_play" to "In game: drag the floating button anywhere, ≡ opens quick settings, and a long press on it quits the bot.",
+                    "tab_home" to "CORE", "tab_profiles" to "MATRIX", "tab_modules" to "MODULES", "tab_settings" to "SYS",
+                    "banner" to "▌WCB//NEXUS   build 0x2F4A   kernel r7",
+                    "prompt" to "root@neuro-link:~# ./wcb --init --mode=ocr",
+                    "st_matrix" to "MATRIX.ACTIVE", "st_pos" to "INPUT.MAP", "st_zt" to "VISION.T", "st_zs" to "VISION.S",
+                    "st_acc" to "RELAY", "st_loot" to "LOOT.SEQ",
+                    "unset" to "unset", "steps" to "step(s)",
+                    "sec_perm" to "[0x01] ACCESS.GRANT", "hint_perm" to "# system permissions",
+                    "sec_pos" to "[0x02] INPUT.MAPPING", "hint_pos" to "# 3a joystick + attack · 3b target HP zone · 3c own HP zone",
+                    "sec_launch" to "[0x03] EXEC.CORE", "hint_launch" to "# bot launch",
+                    "b_overlay" to "1a · OVERLAY.AUTH", "b_access" to "1b · RELAY.ENABLE",
+                    "b_3a" to "3a · INPUT.MAP", "b_3b" to "3b · VISION.ZONE.T", "b_3c" to "3c · VISION.ZONE.S",
+                    "b_test" to "SELF.TEST · gestures (in 8 s)",
+                    "b_start" to "EXEC · START", "b_quit" to "ABORT · KILL.PROC",
+                    "tip_play" to "# in game: drag the floating button · ≡ opens the console · long press = KILL",
                     "t_overlay" to "First allow display over other apps (1a)",
                     "t_access" to "First enable the accessibility service (1b)",
                     "t_pos" to "First place the joystick and the attack button (3a)",
-                    "t_zone" to "First place the HP number zone (3b)",
-                    "t_images" to "Add at least one image (Settings, image detection)",
+                    "t_zone" to "First place the target HP number zone (3b)",
                     "t_stopped" to "Bot stopped",
                     "t_calib" to "Open WildCraft: setup starts in 12 seconds",
                     "t_test" to "Open WildCraft: test in 8 seconds",
-                    "t_added" to "image(s) added",
                     "t_open" to "Open WildCraft and use the floating ▶ button",
-                    "prof_hint" to "Each profile keeps its own positions, settings and commands (e.g. Solo, Multi).",
-                    "sec_profiles" to "SAVED PROFILES", "prof_active" to "active", "prof_new" to "NEW PROFILE",
-                    "prof_name" to "Profile name", "prof_create" to "Create profile", "prof_dup" to "Duplicate the active profile",
+                    "t_noseq" to "No sequence recorded (MODULES, LOOT.PROTOCOL)",
+                    "sec_profiles" to "[0x10] MATRIX.SLOTS", "hint_profiles" to "# each profile keeps its own positions and settings (e.g. Solo, Multi)",
+                    "prof_active" to "active", "prof_new" to "[0x11] MATRIX.NEW",
+                    "prof_name" to "Profile ID", "prof_create" to "SLOT.CREATE", "prof_dup" to "SLOT.CLONE",
                     "prof_exists" to "This name already exists", "prof_empty" to "Give the profile a name",
-                    "prof_del_q" to "Delete this profile and its commands?", "yes" to "Yes", "no" to "No",
-                    "cmd_hint" to "A command taps a point of the game screen by itself. It belongs to the active profile.",
-                    "sec_cmds" to "COMMANDS", "cmd_add" to "+ Add a command", "cmd_none" to "No command for this profile.",
-                    "cmd_name" to "Name (e.g. Eat)", "cmd_action" to "Action", "cmd_tap" to "Tap", "cmd_hold" to "Hold",
-                    "cmd_ms" to "Hold duration (ms)", "cmd_when" to "When",
-                    "cmd_t0" to "Always", "cmd_t1" to "Facing an NPC", "cmd_t2" to "Facing a boss",
-                    "cmd_every" to "Every (seconds)", "cmd_save" to "Save", "cmd_cancel" to "Cancel",
-                    "cmd_edit" to "Edit", "cmd_place" to "Place", "cmd_del" to "Delete",
-                    "cmd_unplaced" to "position not placed", "cmd_placed" to "position OK",
-                    "cmd_new" to "New command", "cmd_edit_t" to "Edit command",
-                    "cmd_pos_step" to "Touch the spot of the button", "cmd_pos_ok" to "Position saved ✔",
-                    "s_tap" to "tap", "s_hold" to "hold", "s_every" to "every",
-                    "sec_lang" to "LANGUAGE", "sec_detect" to "DETECTION", "sec_boss" to "BOSS FIGHT", "sec_adv" to "ADVANCED: IMAGE DETECTION",
-                    "set_method" to "Read the HP number (off = image detection)",
+                    "prof_del_q" to "Delete this profile?", "yes" to "Yes", "no" to "No",
+                    "sec_vitals" to "[0x20] VITALS.GUARD",
+                    "hint_vitals" to "# small bosses: if MY health drops below the threshold, my character moves. Big bosses: circling as before",
+                    "mod_surv" to "VITALS.GUARD enabled",
+                    "set_big" to "Big boss from (HP)",
+                    "set_low" to "Move when my HP drops below (%)",
+                    "set_resume" to "Resume when it climbs back to (%)",
+                    "set_flee" to "Escape direction",
+                    "sec_loot" to "[0x30] LOOT.PROTOCOL",
+                    "hint_loot" to "# after a boss dies: replays your taps (menu, button, button...)",
+                    "mod_loot" to "LOOT.PROTOCOL enabled",
+                    "b_seq_rec" to "SEQ.RECORD · place the buttons",
+                    "b_seq_test" to "SEQ.RUN · test (in 8 s)",
+                    "set_lstart" to "Wait after the boss dies (ms)",
+                    "set_ldelay" to "Pause between two taps (ms)",
+                    "set_lrepeat" to "Repeat the sequence (times)",
+                    "sec_lang" to "[0x40] LOCALE", "sec_detect" to "[0x41] VISION.OCR", "sec_boss" to "[0x42] THREAT.ENGINE",
+                    "hint_detect" to "# reading the target's HP number",
+                    "hint_boss" to "# behavior against bosses",
                     "set_hpboss" to "HP from which it is a BOSS (e.g. 10000)",
                     "set_miss" to "Failed reads before the boss is over (1 = about 0.3 s)",
                     "set_fixed" to "Fixed joystick mode (off = free)",
-                    "set_dir" to "Direction held around the boss",
+                    "set_dir" to "Direction held around the big boss",
                     "set_radius" to "Joystick amplitude",
                     "set_atk" to "Tap attack during the boss",
-                    "set_tol" to "Boss: bar color tolerance",
-                    "set_thrnpc" to "NPC: sensitivity (%)",
-                    "set_thrboss" to "Boss: share of the bar to find (%)",
-                    "img_info" to "NPC: cropped images of the NPC (name or icon). BOSS: colored part of the health bar, no border or background.",
-                    "b_img_npc" to "NPC: add images", "b_img_boss" to "BOSS: add health bar images",
-                    "b_clr_npc" to "Clear NPC images", "b_clr_boss" to "Clear boss images",
                     "c_joy" to "Touch the CENTER of the movement joystick",
                     "c_btn" to "Touch the ATTACK button",
-                    "c_z1" to "Touch the TOP-LEFT corner of the HP number zone",
-                    "c_z2" to "Touch the BOTTOM-RIGHT corner of this zone (around the number only)",
-                    "c_done_btn" to "Positions saved ✔", "c_done_zone" to "HP number zone saved ✔",
+                    "c_z1" to "TARGET: touch the TOP-LEFT corner of the HP number zone",
+                    "c_z2" to "TARGET: touch the BOTTOM-RIGHT corner (around the number only)",
+                    "c_s1" to "MY HP: touch the TOP-LEFT corner of the number zone",
+                    "c_s2" to "MY HP: touch the BOTTOM-RIGHT corner (around the number only)",
+                    "c_loot_n" to "Touch button no. ",
+                    "c_loot_done" to "Done",
+                    "c_done_btn" to "Positions saved ✔", "c_done_zone" to "Zone saved ✔", "c_done_loot" to "Sequence saved ✔",
                     "c_cancel" to "Cancel",
-                    "o_title" to "// IN-GAME SETTINGS (applies to the next boss)",
-                    "o_dir" to "Direction (°)", "o_hp" to "Boss if HP ≥", "o_radius" to "Joystick amplitude",
-                    "o_atk" to "Attack during boss", "o_yes" to "YES", "o_no" to "NO",
-                    "o_joy" to "Joystick", "o_fixed" to "FIXED", "o_free" to "FREE", "o_quit" to "[ QUIT THE BOT ]",
-                    "o_noimg" to "no image received", "o_nonum" to "no number read", "o_accoff" to "ACCESSIBILITY OFF", "o_life" to "HP"
+                    "o_title" to "// CTRL.PANEL", "o_threat" to "// THREAT.ENGINE", "o_vitals" to "// VITALS.GUARD", "o_loot" to "// LOOT.PROTOCOL",
+                    "o_hint" to "# applies to the next fight",
+                    "o_dir" to "Direction (°)", "o_hp" to "Boss if HP ≥", "o_big" to "Big boss ≥", "o_radius" to "Joystick amplitude",
+                    "o_atk" to "Attack during boss", "o_joy" to "Joystick", "o_fixed" to "FIXED", "o_free" to "FREE",
+                    "o_surv" to "Survival", "o_low" to "Move below (%)", "o_resume" to "Resume (%)", "o_flee" to "Escape (°)",
+                    "o_lootT" to "Auto loot", "o_run" to "▸ SEQ.RUN now",
+                    "o_yes" to "YES", "o_no" to "NO", "o_quit" to "[ KILL.PROC ]",
+                    "o_noimg" to "no image received", "o_nonum" to "no number read", "o_accoff" to "RELAY OFF",
+                    "o_life" to "HP", "o_me" to "me", "o_npc" to "NPC", "o_loot_run" to "LOOT running"
                 )
             }
             WCEOF
@@ -1264,6 +1208,8 @@ jobs:
             import android.media.projection.MediaProjectionManager
             import android.net.Uri
             import android.os.Bundle
+            import android.os.Handler
+            import android.os.Looper
             import android.provider.Settings
             import android.text.Editable
             import android.text.InputType
@@ -1284,8 +1230,6 @@ jobs:
             import android.widget.TextView
             import android.widget.Toast
             import org.json.JSONArray
-            import org.json.JSONObject
-            import java.io.File
 
             class MainActivity : Activity() {
                 private val GREEN = 0xFF00FF41.toInt()
@@ -1294,17 +1238,17 @@ jobs:
                 private val AMBER = 0xFFFFB000.toInt()
                 private val RED = 0xFFFF4D4D.toInt()
                 private val SOFT = 0xFF9FE8B4.toInt()
+                private val FAINT = 0xFF4E7A5B.toInt()
                 private val BG = 0xFF050A05.toInt()
                 private val PANEL = 0xFF0D1A0D.toInt()
                 private val CARD = 0xFF081008.toInt()
-                private val PICK_NPC = 1
-                private val PICK_BOSS = 2
                 private val REQ_CAPTURE = 3
 
                 private var tab = 0
                 private var content: FrameLayout? = null
                 private var tabBar: LinearLayout? = null
                 private var status: TextView? = null
+                private val handler = Handler(Looper.getMainLooper())
 
                 private fun cfg() = Store.cfg(this)
                 private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
@@ -1365,8 +1309,10 @@ jobs:
                     return tv
                 }
 
-                private fun section(box: LinearLayout, title: String): LinearLayout {
+                /** Carte avec un titre technique et un commentaire en gris. */
+                private fun section(box: LinearLayout, title: String, hint: String): LinearLayout {
                     text(box, "── " + title + " ──", CYAN, 13f, 22)
+                    if (hint.isNotEmpty()) text(box, hint, FAINT, 11f, 2)
                     val card = LinearLayout(this)
                     card.orientation = LinearLayout.VERTICAL
                     card.background = outline(DIM, CARD, 8)
@@ -1457,6 +1403,15 @@ jobs:
                     paint()
                 }
 
+                private val compassLabels = listOf("→", "↘", "↓", "↙", "←", "↖", "↑", "↗")
+                private val compassDegrees = listOf(0, 45, 90, 135, 180, 225, 270, 315)
+
+                private fun compass(parent: LinearLayout, key: String, def: Int) {
+                    choices(parent, compassLabels, maxOf(0, compassDegrees.indexOf(cfg().getInt(key, def))), 4) { i ->
+                        cfg().edit().putInt(key, compassDegrees[i]).apply()
+                    }
+                }
+
                 // ---------------------------------------------------------------- squelette + onglets
                 override fun onCreate(savedInstanceState: Bundle?) {
                     super.onCreate(savedInstanceState)
@@ -1484,11 +1439,17 @@ jobs:
                     if (tab == 0) refreshStatus()
                 }
 
+                override fun onDestroy() {
+                    handler.removeCallbacksAndMessages(null)
+                    super.onDestroy()
+                }
+
                 private fun showTab(i: Int) {
+                    handler.removeCallbacksAndMessages(null)
                     tab = i
                     val bar = tabBar ?: return
                     bar.removeAllViews()
-                    val names = listOf("tab_home", "tab_profiles", "tab_commands", "tab_settings")
+                    val names = listOf("tab_home", "tab_profiles", "tab_modules", "tab_settings")
                     for ((idx, k) in names.withIndex()) {
                         val b = Button(this)
                         b.text = L.t(k)
@@ -1513,38 +1474,74 @@ jobs:
                         when (i) {
                             0 -> tabHome()
                             1 -> tabProfiles()
-                            2 -> tabCommands()
+                            2 -> tabModules()
                             else -> tabSettings()
                         }
                     )
                 }
 
-                // ---------------------------------------------------------------- onglet ACCUEIL
+                // ---------------------------------------------------------------- onglet CORE
                 private fun tabHome(): ScrollView {
                     val (sv, box) = newPage()
-                    text(box, L.t("prompt"), DIM, 12f, 0)
-                    text(box, "> " + getString(R.string.app_name).uppercase() + "_", GREEN, 26f, 4)
-                    text(box, L.t("active_profile") + " : " + Store.active(this), CYAN, 13f, 6)
-                    val st = text(box, "", GREEN, 13f, 12)
+                    text(box, L.t("banner"), FAINT, 11f, 0)
+                    text(box, L.t("prompt"), DIM, 11f, 2)
+                    val title = text(box, "> WILDCRAFT BOT_", GREEN, 26f, 6)
+
+                    // curseur clignotant
+                    var on = true
+                    val blink = object : Runnable {
+                        override fun run() {
+                            title.text = if (on) "> WILDCRAFT BOT_" else "> WILDCRAFT BOT "
+                            on = !on
+                            handler.postDelayed(this, 550)
+                        }
+                    }
+                    handler.postDelayed(blink, 550)
+
+                    // séquence de démarrage
+                    val boot = text(box, "", FAINT, 11f, 6)
+                    val acc = BotAccessibility.instance != null
+                    val ov = Settings.canDrawOverlays(this)
+                    val lines = listOf(
+                        "> kernel.init ............ OK",
+                        "> vision.ocr.mount ....... OK",
+                        "> relay.access ........... " + (if (acc) "OK" else "WAIT"),
+                        "> overlay.hud ............ " + (if (ov) "OK" else "WAIT"),
+                        "> matrix.load [" + Store.active(this) + "] .. OK"
+                    )
+                    var idx = 0
+                    val bootRun = object : Runnable {
+                        override fun run() {
+                            if (idx < lines.size) {
+                                boot.append(lines[idx] + "\n")
+                                idx++
+                                handler.postDelayed(this, 130)
+                            }
+                        }
+                    }
+                    handler.postDelayed(bootRun, 150)
+
+                    val st = text(box, "", GREEN, 13f, 10)
                     st.background = outline(DIM, PANEL, 8)
                     st.setPadding(dp(12), dp(10), dp(12), dp(10))
                     status = st
 
-                    val s1 = section(box, L.t("sec_perm"))
+                    val s1 = section(box, L.t("sec_perm"), L.t("hint_perm"))
                     button(s1, L.t("b_overlay"), GREEN) {
                         startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + packageName)))
                     }
                     button(s1, L.t("b_access"), GREEN) { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
 
-                    val s2 = section(box, L.t("sec_pos"))
-                    button(s2, L.t("b_3a"), CYAN) { calibrate("buttons", -1, "") }
-                    button(s2, L.t("b_3b"), CYAN) { calibrate("zone", -1, "") }
+                    val s2 = section(box, L.t("sec_pos"), L.t("hint_pos"))
+                    button(s2, L.t("b_3a"), CYAN) { calibrate("buttons") }
+                    button(s2, L.t("b_3b"), CYAN) { calibrate("zone") }
+                    button(s2, L.t("b_3c"), CYAN) { calibrate("self") }
                     button(s2, L.t("b_test"), AMBER) { testGestures() }
 
-                    val s3 = section(box, L.t("sec_launch"))
+                    val s3 = section(box, L.t("sec_launch"), L.t("hint_launch"))
                     button(s3, L.t("b_start"), GREEN) { start() }
                     button(s3, L.t("b_quit"), RED) { quitBot() }
-                    text(s3, L.t("tip_play"), SOFT, 12f, 10)
+                    text(s3, L.t("tip_play"), FAINT, 11f, 10)
                     refreshStatus()
                     return sv
                 }
@@ -1556,28 +1553,31 @@ jobs:
                     sb.append(label).append(" : ").append(value).append("\n")
                 }
 
-                private fun count(prefix: String): Int =
-                    (filesDir.listFiles() ?: emptyArray()).count { it.name.startsWith(prefix) }
+                private fun lootCount(): Int =
+                    try { JSONArray(cfg().getString("lootPts", "[]")).length() } catch (e: Exception) { 0 }
 
                 private fun refreshStatus() {
                     val c = cfg()
                     val pos = c.contains("joyFX") && c.contains("btnFX")
-                    val zone = c.contains("hp1FX") && c.contains("hp2FX")
+                    val zt = c.contains("hp1FX") && c.contains("hp2FX")
+                    val zs = c.contains("me1FX") && c.contains("me2FX")
                     val acc = BotAccessibility.instance != null
+                    val n = lootCount()
                     val sb = SpannableStringBuilder()
-                    statusLine(sb, pos, L.t("st_pos"), if (pos) "OK" else L.t("to_3a"))
-                    statusLine(sb, zone, L.t("st_zone"), if (zone) "OK" else L.t("to_3b"))
-                    statusLine(sb, acc, L.t("st_acc"), if (acc) "ON" else L.t("off_1b"))
-                    statusLine(sb, true, L.t("st_img"), count("npc_").toString() + " / " + count("boss_").toString())
+                    statusLine(sb, true, L.t("st_matrix"), Store.active(this))
+                    statusLine(sb, pos, L.t("st_pos"), if (pos) "OK" else L.t("unset"))
+                    statusLine(sb, zt, L.t("st_zt"), if (zt) "OK" else L.t("unset"))
+                    statusLine(sb, zs, L.t("st_zs"), if (zs) "OK" else L.t("unset"))
+                    statusLine(sb, acc, L.t("st_acc"), if (acc) "ON" else "OFF")
+                    statusLine(sb, n > 0, L.t("st_loot"), n.toString() + " " + L.t("steps"))
                     status?.text = sb
                 }
 
-                // ---------------------------------------------------------------- onglet PROFILS
+                // ---------------------------------------------------------------- onglet MATRIX (profils)
                 private fun tabProfiles(): ScrollView {
                     val (sv, box) = newPage()
                     text(box, L.t("tab_profiles"), GREEN, 22f, 0)
-                    text(box, L.t("prof_hint"), SOFT, 12f, 6)
-                    val list = section(box, L.t("sec_profiles"))
+                    val list = section(box, L.t("sec_profiles"), L.t("hint_profiles"))
                     val active = Store.active(this)
                     for (name in Store.profiles(this)) {
                         val row = LinearLayout(this)
@@ -1601,7 +1601,7 @@ jobs:
                         list.addView(row, lp(8))
                     }
 
-                    val s2 = section(box, L.t("prof_new"))
+                    val s2 = section(box, L.t("prof_new"), "")
                     val et = EditText(this)
                     et.hint = L.t("prof_name")
                     et.setHintTextColor(DIM)
@@ -1618,8 +1618,7 @@ jobs:
                         else { Store.add(this, n); Store.setActive(this, n); showTab(1) }
                     }
                     button(s2, L.t("prof_dup"), CYAN) {
-                        val base = active + " 2"
-                        var n = base
+                        var n = active + " 2"
                         var k = 2
                         while (Store.exists(this, n)) { k++; n = active + " " + k }
                         Store.duplicate(this, active, n)
@@ -1637,156 +1636,50 @@ jobs:
                         .show()
                 }
 
-                // ---------------------------------------------------------------- onglet COMMANDES
-                private fun cmdArray(): JSONArray =
-                    try { JSONArray(cfg().getString("cmds", "[]")) } catch (e: Exception) { JSONArray() }
-
-                private fun saveCmds(a: JSONArray) { cfg().edit().putString("cmds", a.toString()).apply() }
-
-                private fun tabCommands(): ScrollView {
+                // ---------------------------------------------------------------- onglet MODULES
+                private fun tabModules(): ScrollView {
                     val (sv, box) = newPage()
-                    text(box, L.t("tab_commands"), GREEN, 22f, 0)
-                    text(box, L.t("cmd_hint"), SOFT, 12f, 6)
-                    val arr = cmdArray()
-                    val list = section(box, L.t("sec_cmds") + " · " + Store.active(this))
-                    if (arr.length() == 0) text(list, L.t("cmd_none"), SOFT, 13f, 8)
-                    for (i in 0 until arr.length()) {
-                        val o = arr.getJSONObject(i)
-                        val head = LinearLayout(this)
-                        head.orientation = LinearLayout.HORIZONTAL
-                        head.gravity = Gravity.CENTER_VERTICAL
-                        val nameTv = TextView(this)
-                        nameTv.text = o.optString("n", "?")
-                        nameTv.setTextColor(GREEN)
-                        nameTv.typeface = Typeface.MONOSPACE
-                        nameTv.textSize = 16f
-                        val sw = Switch(this)
-                        styleSwitch(sw)
-                        sw.isChecked = o.optInt("e", 1) == 1
-                        sw.setOnCheckedChangeListener { _, c ->
-                            val a = cmdArray()
-                            a.getJSONObject(i).put("e", if (c) 1 else 0)
-                            saveCmds(a)
-                        }
-                        head.addView(nameTv, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-                        head.addView(sw)
-                        list.addView(head, lp(14))
+                    text(box, L.t("tab_modules"), GREEN, 22f, 0)
 
-                        val placed = o.optDouble("x", -1.0) >= 0
-                        val action = if (o.optInt("a", 0) == 1) L.t("s_hold") + " " + o.optInt("ms", 600) + " ms" else L.t("s_tap")
-                        val summary = action + " · " + L.t("s_every") + " " + o.optInt("s", 30) + " s · " +
-                            L.t("cmd_t" + o.optInt("t", 0)) + "\n" + (if (placed) L.t("cmd_placed") else L.t("cmd_unplaced"))
-                        text(list, summary, if (placed) SOFT else AMBER, 12f, 4)
+                    val sv1 = section(box, L.t("sec_vitals"), L.t("hint_vitals"))
+                    switchRow(sv1, "mod_surv", "surv", 0)
+                    numField(sv1, "set_big", "hpBig", 100000)
+                    numField(sv1, "set_low", "selfLow", 40)
+                    numField(sv1, "set_resume", "selfResume", 70)
+                    text(sv1, L.t("set_flee"), SOFT, 12f, 14)
+                    compass(sv1, "dirFlee", 180)
+                    button(sv1, L.t("b_3c"), CYAN) { calibrate("self") }
 
-                        val row = LinearLayout(this)
-                        row.orientation = LinearLayout.HORIZONTAL
-                        fun small(t: String, color: Int, a: () -> Unit) {
-                            val b = Button(this)
-                            b.text = t
-                            styled(b, color)
-                            b.textSize = 12f
-                            b.gravity = Gravity.CENTER
-                            b.setOnClickListener { a() }
-                            val l = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-                            l.rightMargin = dp(6)
-                            row.addView(b, l)
-                        }
-                        small(L.t("cmd_edit"), GREEN) { editCommand(i) }
-                        small(L.t("cmd_place"), CYAN) { calibrate("cmd", i, o.optString("n", "")) }
-                        small(L.t("cmd_del"), RED) {
-                            val a = cmdArray()
-                            a.remove(i)
-                            saveCmds(a)
-                            showTab(2)
-                        }
-                        list.addView(row, lp(8))
-                    }
-                    button(box, L.t("cmd_add"), GREEN) { editCommand(-1) }
+                    val sl = section(box, L.t("sec_loot"), L.t("hint_loot"))
+                    switchRow(sl, "mod_loot", "loot", 0)
+                    text(sl, "# " + lootCount() + " " + L.t("steps"), FAINT, 11f, 8)
+                    button(sl, L.t("b_seq_rec"), CYAN) { calibrate("loot") }
+                    numField(sl, "set_lstart", "lootStart", 2000)
+                    numField(sl, "set_ldelay", "lootDelay", 800)
+                    numField(sl, "set_lrepeat", "lootRepeat", 1)
+                    button(sl, L.t("b_seq_test"), AMBER) { testLoot() }
                     return sv
                 }
 
-                private fun editCommand(idx: Int) {
-                    val arr = cmdArray()
-                    val old = if (idx >= 0) arr.getJSONObject(idx) else JSONObject()
-                    var action = old.optInt("a", 0)
-                    var trig = old.optInt("t", 0)
-
-                    val sv = ScrollView(this)
-                    sv.setBackgroundColor(BG)
-                    val box = LinearLayout(this)
-                    box.orientation = LinearLayout.VERTICAL
-                    box.setPadding(dp(16), dp(16), dp(16), dp(8))
-                    sv.addView(box)
-
-                    fun field(hint: String, value: String, numeric: Boolean): EditText {
-                        text(box, hint, SOFT, 12f, 12)
-                        val et = EditText(this)
-                        et.setText(value)
-                        if (numeric) et.inputType = InputType.TYPE_CLASS_NUMBER
-                        et.setTextColor(GREEN)
-                        et.typeface = Typeface.MONOSPACE
-                        et.background = outline(DIM, PANEL, 4)
-                        et.setPadding(dp(12), dp(8), dp(12), dp(8))
-                        box.addView(et, lp(4))
-                        return et
-                    }
-
-                    val nameEt = field(L.t("cmd_name"), old.optString("n", ""), false)
-                    text(box, L.t("cmd_action"), SOFT, 12f, 14)
-                    choices(box, listOf(L.t("cmd_tap"), L.t("cmd_hold")), action, 2) { action = it }
-                    val msEt = field(L.t("cmd_ms"), old.optInt("ms", 600).toString(), true)
-                    text(box, L.t("cmd_when"), SOFT, 12f, 14)
-                    choices(box, listOf(L.t("cmd_t0"), L.t("cmd_t1"), L.t("cmd_t2")), trig, 3) { trig = it }
-                    val everyEt = field(L.t("cmd_every"), old.optInt("s", 30).toString(), true)
-
-                    AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
-                        .setTitle(if (idx >= 0) L.t("cmd_edit_t") else L.t("cmd_new"))
-                        .setView(sv)
-                        .setPositiveButton(L.t("cmd_save")) { _, _ ->
-                            val o = JSONObject()
-                            val n = nameEt.text.toString().trim()
-                            o.put("n", if (n.isEmpty()) "Cmd" else n)
-                            o.put("x", old.optDouble("x", -1.0))
-                            o.put("y", old.optDouble("y", -1.0))
-                            o.put("a", action)
-                            o.put("ms", (msEt.text.toString().toIntOrNull() ?: 600).coerceIn(60, 10000))
-                            o.put("t", trig)
-                            o.put("s", (everyEt.text.toString().toIntOrNull() ?: 30).coerceAtLeast(1))
-                            o.put("e", old.optInt("e", 1))
-                            val a = cmdArray()
-                            var at = idx
-                            if (idx >= 0) a.put(idx, o) else { a.put(o); at = a.length() - 1 }
-                            saveCmds(a)
-                            showTab(2)
-                            if (idx < 0) calibrate("cmd", at, o.optString("n", ""))
-                        }
-                        .setNegativeButton(L.t("cmd_cancel"), null)
-                        .show()
-                }
-
-                // ---------------------------------------------------------------- onglet REGLAGES
+                // ---------------------------------------------------------------- onglet SYS
                 private fun tabSettings(): ScrollView {
                     val (sv, box) = newPage()
                     text(box, L.t("tab_settings"), GREEN, 22f, 0)
 
-                    val sl = section(box, L.t("sec_lang"))
+                    val sl = section(box, L.t("sec_lang"), "")
                     choices(sl, listOf("Français", "English"), if (L.lang == "en") 1 else 0, 2) { i ->
                         L.set(this, if (i == 1) "en" else "fr")
                         showTab(3)
                     }
 
-                    val sd = section(box, L.t("sec_detect"))
-                    switchRow(sd, "set_method", "ocr", 1)
+                    val sd = section(box, L.t("sec_detect"), L.t("hint_detect"))
                     numField(sd, "set_hpboss", "hpBoss", 10000)
                     numField(sd, "set_miss", "bossMiss", 4)
 
-                    val sb = section(box, L.t("sec_boss"))
+                    val sb = section(box, L.t("sec_boss"), L.t("hint_boss"))
                     switchRow(sb, "set_fixed", "fixed", 1)
                     text(sb, L.t("set_dir"), SOFT, 12f, 14)
-                    val dirs = listOf(0, 45, 90, 135, 180, 225, 270, 315)
-                    choices(sb, listOf("→", "↘", "↓", "↙", "←", "↖", "↑", "↗"), maxOf(0, dirs.indexOf(cfg().getInt("dir", 0))), 4) { i ->
-                        cfg().edit().putInt("dir", dirs[i]).apply()
-                    }
+                    compass(sb, "dir", 0)
                     val rv = text(sb, L.t("set_radius") + " : " + cfg().getInt("radius", 90), SOFT, 12f, 16)
                     val seek = SeekBar(this)
                     seek.max = 280
@@ -1803,29 +1696,7 @@ jobs:
                     })
                     sb.addView(seek, lp(4))
                     switchRow(sb, "set_atk", "atkBoss", 0)
-
-                    val sa = section(box, L.t("sec_adv"))
-                    text(sa, L.t("img_info"), SOFT, 12f, 6)
-                    numField(sa, "set_tol", "tolColor", 35)
-                    numField(sa, "set_thrnpc", "thrNpc", 75)
-                    numField(sa, "set_thrboss", "thrBoss", 75)
-                    button(sa, L.t("b_img_npc") + " (" + count("npc_") + ")", GREEN) { pick(PICK_NPC) }
-                    button(sa, L.t("b_img_boss") + " (" + count("boss_") + ")", GREEN) { pick(PICK_BOSS) }
-                    button(sa, L.t("b_clr_npc"), AMBER) { clear("npc_") }
-                    button(sa, L.t("b_clr_boss"), AMBER) { clear("boss_") }
                     return sv
-                }
-
-                private fun clear(prefix: String) {
-                    (filesDir.listFiles() ?: emptyArray()).filter { it.name.startsWith(prefix) }.forEach { it.delete() }
-                    showTab(3)
-                }
-
-                private fun pick(code: Int) {
-                    val i = Intent(Intent.ACTION_GET_CONTENT)
-                    i.type = "image/*"
-                    i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
-                    startActivityForResult(i, code)
                 }
 
                 // ---------------------------------------------------------------- actions
@@ -1836,12 +1707,10 @@ jobs:
                     toast("t_stopped")
                 }
 
-                private fun calibrate(mode: String, index: Int, name: String) {
+                private fun calibrate(mode: String) {
                     if (!Settings.canDrawOverlays(this)) { toast("t_overlay"); return }
                     val cs = Intent(this, CalibService::class.java)
                     cs.putExtra("mode", mode)
-                    cs.putExtra("index", index)
-                    cs.putExtra("name", name)
                     startService(cs)
                     toast("t_calib")
                     moveTaskToBack(true)
@@ -1871,8 +1740,35 @@ jobs:
                             acc.tap(bx, by)
                             Thread.sleep(1500)
                             val end = System.currentTimeMillis() + 3000
-                            acc.holdDirection(jx, jy, tx, ty, bx, by, false, { emptyList() }) { System.currentTimeMillis() < end }
+                            acc.holdDirection(jx, jy, tx, ty, bx, by, false) { System.currentTimeMillis() < end }
                             acc.tap(jx, jy)
+                        } catch (e: Exception) {}
+                    }.start()
+                }
+
+                @Suppress("DEPRECATION")
+                private fun testLoot() {
+                    val c = cfg()
+                    val acc = BotAccessibility.instance
+                    if (acc == null) { toast("t_access"); return }
+                    val pts = try { JSONArray(c.getString("lootPts", "[]")) } catch (e: Exception) { JSONArray() }
+                    if (pts.length() == 0) { toast("t_noseq"); return }
+                    val dm = DisplayMetrics()
+                    windowManager.defaultDisplay.getRealMetrics(dm)
+                    val delay = c.getInt("lootDelay", 800).toLong()
+                    val repeat = c.getInt("lootRepeat", 1).coerceIn(1, 30)
+                    toast("t_test")
+                    moveTaskToBack(true)
+                    Thread {
+                        try {
+                            Thread.sleep(8000)
+                            for (r in 0 until repeat) {
+                                for (i in 0 until pts.length()) {
+                                    val p = pts.getJSONArray(i)
+                                    acc.tap((p.getDouble(0) * dm.widthPixels / 100.0).toInt(), (p.getDouble(1) * dm.heightPixels / 100.0).toInt())
+                                    Thread.sleep(delay)
+                                }
+                            }
                         } catch (e: Exception) {}
                     }.start()
                 }
@@ -1882,12 +1778,7 @@ jobs:
                     if (!Settings.canDrawOverlays(this)) { toast("t_overlay"); return }
                     if (BotAccessibility.instance == null) { toast("t_access"); return }
                     if (!c.contains("joyFX") || !c.contains("btnFX")) { toast("t_pos"); return }
-                    if (c.getInt("ocr", 1) == 1) {
-                        if (!c.contains("hp1FX") || !c.contains("hp2FX")) { toast("t_zone"); return }
-                    } else if (count("npc_") + count("boss_") == 0) {
-                        toast("t_images")
-                        return
-                    }
+                    if (!c.contains("hp1FX") || !c.contains("hp2FX")) { toast("t_zone"); return }
                     val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
                     startActivityForResult(mpm.createScreenCaptureIntent(), REQ_CAPTURE)
                 }
@@ -1895,26 +1786,7 @@ jobs:
                 override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
                     super.onActivityResult(requestCode, resultCode, data)
                     if (resultCode != RESULT_OK || data == null) return
-                    if (requestCode == PICK_NPC || requestCode == PICK_BOSS) {
-                        val uris = ArrayList<Uri>()
-                        val clip = data.clipData
-                        if (clip != null) {
-                            for (i in 0 until clip.itemCount) uris.add(clip.getItemAt(i).uri)
-                        } else {
-                            data.data?.let { uris.add(it) }
-                        }
-                        val prefix = if (requestCode == PICK_NPC) "npc_" else "boss_"
-                        var n = 0
-                        for (u in uris) {
-                            contentResolver.openInputStream(u)?.use { input ->
-                                File(filesDir, prefix + System.currentTimeMillis() + "_" + n + ".img")
-                                    .outputStream().use { input.copyTo(it) }
-                            }
-                            n++
-                        }
-                        Toast.makeText(this, n.toString() + " " + L.t("t_added"), Toast.LENGTH_SHORT).show()
-                        showTab(3)
-                    } else if (requestCode == REQ_CAPTURE) {
+                    if (requestCode == REQ_CAPTURE) {
                         val s = Intent(this, BotService::class.java)
                         s.putExtra("code", resultCode)
                         s.putExtra("data", data)
